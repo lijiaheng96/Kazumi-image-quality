@@ -115,6 +115,9 @@ class Job:
             message='搜索完成，请确认同一部番剧的来源'
             if self.data['kind']=='analyze':
                 message='检测完成' if any(row.get('rank') for row in self.data['results']) else '检测结束，未形成跨站排名，请查看各线路原因'
+                summary = self.data.get('selection_summary')
+                if self.data.get('mode') == 'smart' and not any(row.get('rank') for row in self.data['results']) and isinstance(summary, str) and summary.strip():
+                    message = f'检测结束，{summary.strip()}；请查看各线路原因'
             self.update(status='completed', progress=100, message=message)
 
 
@@ -173,7 +176,9 @@ class JobManager:
     def _search(self, job, all_rules, keyword, ids):
         from . import rules
         job.rules = all_rules
+        job.update(searched_rule_ids=[])
         results, errors = [], []
+        searched = set()
         selected_rules = [(index, all_rules[index]) for index in ids]
         with ThreadPoolExecutor(max_workers=3) as pool:
             def search_one(rule):
@@ -200,23 +205,38 @@ class JobManager:
                         errors.append(dict(site=site, message='没有找到匹配条目'))
                 except Exception as error:
                     errors.append(dict(site=site, message=error_message(error)))
-                job.update(results=results, errors=errors, progress=round(completed / len(pending)*100), message=f'已搜索 {completed}/{len(pending)} 个网站')
+                # 搜索失败也算已尝试；取消后没有执行完的规则不计入覆盖范围。
+                searched.add(index)
+                job.update(results=results, errors=errors, searched_rule_ids=sorted(searched), progress=round(completed / len(pending)*100), message=f'已搜索 {completed}/{len(pending)} 个网站')
 
-    def analyze(self, search_job, candidate_ids, episode, mode='fast'):
-        candidates = [row for row in search_job.snapshot()['results'] if row['id'] in candidate_ids]
+    def analyze(self, search_job, candidate_ids, episode, mode='smart'):
+        search = search_job.snapshot()
+        candidates = [row for row in search['results'] if row['id'] in candidate_ids]
         if len({row['site'] for row in candidates}) != len(candidates):
             raise ValueError('每个网站只能选择同一部番剧的一个条目')
         if len({row['site'] for row in candidates}) < 2:
             raise ValueError('请至少选择两个网站中同一部番剧的来源')
-        if mode not in ('fast','full'):
-            raise ValueError('请选择快速或完整检测模式')
+        if mode not in ('smart','fast','full'):
+            raise ValueError('请选择智能筛选、快速或完整检测模式')
+        if mode == 'smart':
+            searched = search.get('searched_rule_ids')
+            if (not search_job.rules or not isinstance(searched, list)
+                    or any(type(index) is not int for index in searched)
+                    or set(searched) != set(range(len(search_job.rules)))):
+                raise ValueError('智能筛选需要覆盖所有已配置网站，请重新搜索全部规则后再检测')
         job = self.launch('analyze', self._analyze, search_job.rules, candidates, episode, mode)
         job.update(search_job_id=search_job.id, selected_candidate_ids=[row['id'] for row in candidates])
+        if mode == 'smart':
+            job.update(searched_rule_ids=sorted(set(searched)))
         return job
 
-    def _analyze(self, job, all_rules, candidates, requested_episode, mode='fast'):
-        from .pipeline import AnalysisPipeline
-        AnalysisPipeline(self, job, all_rules, candidates, requested_episode, mode).run()
+    def _analyze(self, job, all_rules, candidates, requested_episode, mode='smart'):
+        if mode == 'smart':
+            from .smart_pipeline import SmartPipeline
+            SmartPipeline(self, job, all_rules, candidates, requested_episode, mode).run()
+        else:
+            from .pipeline import AnalysisPipeline
+            AnalysisPipeline(self, job, all_rules, candidates, requested_episode, mode).run()
 
     @staticmethod
     def _reference_frames(media, resolved, metadata, directory, cancel, positions=4):

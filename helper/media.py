@@ -260,6 +260,11 @@ def _parse_metadata(output: str) -> dict:
         raise ValueError("无法识别视频分辨率或编码")
     fps = re.search(r"(\d+(?:\.\d+)?)\s+fps\b", video_line)
     bitrate = re.search(r"(\d+(?:\.\d+)?)\s+kb/s\b", video_line)
+    audio_lines = [line for line in output.splitlines() if "Audio:" in line]
+    audio_line = audio_lines[0] if audio_lines else ""
+    audio_bitrate = re.search(r"(\d+(?:\.\d+)?)\s+kb/s\b", audio_line)
+    duration_line = next((line for line in output.splitlines() if "Duration:" in line), "")
+    container_bitrate = re.search(r"bitrate:\s*(\d+(?:\.\d+)?)\s+kb/s\b", duration_line)
     color_transfer = None
     triple = re.search(r"\b[\w-]+/[\w-]+/([\w-]+)\b", video_line)
     if triple:
@@ -282,7 +287,11 @@ def _parse_metadata(output: str) -> dict:
     return {"duration": duration, "width": width, "height": height,
             "display_aspect_ratio": display_aspect_ratio,
             "codec": codec.group(1), "fps": float(fps.group(1)) if fps else None,
-            "bitrate": int(float(bitrate.group(1)) * 1000) if bitrate else None, "color_transfer": color_transfer}
+            "bitrate": int(float(bitrate.group(1)) * 1000) if bitrate else None,
+            "audio_bitrate": int(float(audio_bitrate.group(1)) * 1000) if audio_bitrate else None,
+            "audio_streams": len(audio_lines),
+            "container_bitrate": int(float(container_bitrate.group(1)) * 1000) if container_bitrate else None,
+            "color_transfer": color_transfer}
 
 
 def _check_media_access(output: str) -> None:

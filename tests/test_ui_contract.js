@@ -126,7 +126,122 @@ async function run() {
   assert.deepEqual([...ui.state.selected].sort(),['b','c'],'刷新后恢复用户实际选择，而非原自动预选');
   assert.equal(ui.state.searchJobId,'original');
   assert.equal(getNode('mode').value,'full');
-  console.log('前端契约验证通过：中文错误、令牌恢复、网站门槛、规则编号、可选集数、评分空值、安全链接与过期任务恢复。');
+
+  // 直接调用页面事件和渲染函数：规格预选不可伪造成模型排名或零分。
+  const smartFailures = [];
+  const verifySmart = async (name, callback) => {
+    try { await callback(); }
+    catch (error) { smartFailures.push(`${name}：${error.message}`); }
+  };
+  await verifySmart('未设置模式时默认提交智能比较', async () => {
+    ui.state.busy = false; ui.state.requesting = false;
+    getNode('mode').value = ''; getNode('episode').value = '1';
+    await getNode('analyze-button').listeners.click();
+    const body = JSON.parse(calls.filter(call => call.url === '/api/analyze' && call.options.method === 'POST').at(-1).options.body);
+    assert.equal(body.mode, 'smart');
+    await settle();
+  });
+  await verifySmart('智能搜索覆盖全部规则且旧模式允许按勾选搜索', async () => {
+    ui.state.busy = false; ui.state.requesting = false;
+    ui.state.selectedRules = new Set(['1']);
+    getNode('mode').value = 'smart'; getNode('keyword').value = '测试番剧';
+    ui.updateControls();
+    assert.equal(getNode('toggle-rules').disabled, true);
+    await getNode('search-form').listeners.submit({ preventDefault() {} });
+    let body = JSON.parse(calls.filter(call => call.url === '/api/search' && call.options.method === 'POST').at(-1).options.body);
+    assert.deepEqual(body.rule_ids, [0, 1]);
+    await settle();
+    ui.state.busy = false; ui.state.requesting = false;
+    getNode('mode').value = 'fast'; ui.state.selectedRules = new Set(['1']);
+    ui.updateControls();
+    assert.equal(getNode('toggle-rules').disabled, false);
+    await getNode('search-form').listeners.submit({ preventDefault() {} });
+    body = JSON.parse(calls.filter(call => call.url === '/api/search' && call.options.method === 'POST').at(-1).options.body);
+    assert.deepEqual(body.rule_ids, [1]);
+    await settle();
+  });
+  await verifySmart('智能比较仍然需要本地模型', () => {
+    getNode('mode').value = 'smart'; ui.state.busy = false; ui.state.requesting = false;
+    ui.state.searchJobId = '智能搜索';
+    ui.state.candidates = [{ id: 'a', site: '甲' }, { id: 'b', site: '乙' }];
+    ui.state.selected = new Set(['a', 'b']); ui.state.config.model_ready = false;
+    ui.updateControls();
+    assert.equal(getNode('analyze-button').disabled, true);
+    ui.state.config.model_ready = true; ui.updateControls();
+    assert.equal(getNode('analyze-button').disabled, false);
+  });
+  const smartJob = { status: 'running', mode: 'smart', highest_resolution: '1920×1080', shortlist_count: 2,
+    selection_summary: '最高分辨率保留 2 个网站，其他线路已排除。', results: [
+      { site: '甲', road: '线路一', status: '取样中', rank: null, score: null, resolution: '1920×1080', codec: 'h264', fps: 23.976,
+        bitrate: null, average_bitrate: 4800000, bitrate_scope: 'total', size_bytes: 800000000, size_kind: 'estimated',
+        size_source: '码率与时长推算', size_note: '包含音频', shortlist_rank: 1, selection_status: 'selected', selection_reason: '最高档中规格预选入围' },
+      { site: '乙', road: '线路二', status: 'skipped', rank: null, score: null, resolution: '1280×720', codec: 'hevc', fps: null,
+        bitrate: null, average_bitrate: null, size_bytes: null, size_kind: 'unknown', selection_status: 'lower_resolution', selection_reason: '低于本次最高分辨率' },
+      { site: '甲', road: '线路三', status: 'skipped', rank: null, score: null, resolution: '1920×1080', codec: 'h264', bitrate: 4000000,
+        size_bytes: 500000000, size_kind: 'exact', size_source: 'HTTP Content-Length', selection_status: 'same_site', selection_reason: '同站仅保留一条线路' },
+    ] };
+  await verifySmart('展示智能筛选范围与各线路排除原因', () => {
+    ui.renderAnalysis(smartJob);
+    const rendered = visibleText(getNode('results-body'));
+    assert.match(getNode('results-summary').textContent, /智能/);
+    assert.match(visibleText(getNode('shortlist-summary')), /1920×1080/);
+    assert.match(visibleText(getNode('shortlist-summary')), /最高分辨率保留 2 个网站/);
+    assert.match(rendered, /预选第 1/);
+    assert.match(rendered, /较低分辨率已排除/);
+    assert.match(rendered, /同站其他线路/);
+    assert.match(rendered, /同站仅保留一条线路/);
+    assert.equal(getNode('metric-ranked').textContent, '0', '规格入选不能自动获得模型排名');
+    const first = getNode('results-body').children[0].children[0];
+    assert.equal(visibleText(first.children[0]).trim(), '—', '最终名次保持空缺');
+    assert.match(visibleText(first.children[3]), /未评分/);
+  });
+  await verifySmart('码率作用范围、帧率和大小可信度准确展示', () => {
+    ui.renderAnalysis(smartJob);
+    const rows = getNode('results-body').children[0].children;
+    const first = visibleText(rows[0].children[2]);
+    assert.match(first, /23\.98 fps/);
+    assert.match(first, /视频码率未知/);
+    assert.match(first, /总码率 4\.80 Mbps/);
+    assert.match(first, /估算.*800\.0 MB/);
+    assert.match(first, /码率与时长推算/);
+    assert.match(first, /包含音频/);
+    const second = visibleText(rows[1].children[2]);
+    assert.match(second, /帧率未知/);
+    assert.match(second, /体积未知/);
+    assert.doesNotMatch(second, /0(?:\.00)? (?:Mbps|fps|MB)/);
+    const third = visibleText(rows[2].children[2]);
+    assert.match(third, /视频码率 4\.00 Mbps/);
+    assert.match(third, /已知.*500\.0 MB/);
+    assert.match(third, /HTTP Content-Length/);
+  });
+  await verifySmart('旧模式结果不残留智能筛选面板', () => {
+    ui.renderAnalysis({ status: 'completed', mode: 'full', results: [] });
+    assert.equal(getNode('shortlist-summary').hidden, true);
+  });
+  await verifySmart('切入智能模式后不能复用旧模式的部分规则搜索', () => {
+    ui.state.busy = false; ui.state.requesting = false; ui.state.searchJobId = '仅部分网站的旧搜索';
+    getNode('mode').value = 'smart';
+    getNode('mode').listeners.change();
+    assert.equal(ui.state.searchJobId, null);
+    assert.equal(ui.state.candidates.length, 0);
+    assert.equal(getNode('analyze-button').disabled, true);
+    assert.match(getNode('notice').textContent, /重新搜索/);
+  });
+  await verifySmart('来源代码转换为中文，体积未知时仍解释原因', () => {
+    ui.renderAnalysis({ mode: 'smart', results: [
+      { site: '甲', size_bytes: 800000000, size_kind: 'estimated', size_source: 'hls_average' },
+      { site: '乙', size_bytes: null, size_kind: 'unknown', size_source: 'unknown', size_note: '源站未提供可靠大小' },
+      { site: '丙', size_bytes: 500000000, size_kind: 'exact', size_source: 'content_range', duration: 1370.18 },
+    ] });
+    const rows = getNode('results-body').children[0].children;
+    assert.match(visibleText(rows[0].children[2]), /播放清单平均码率/);
+    assert.doesNotMatch(visibleText(rows[0].children[2]), /hls_average/);
+    assert.match(visibleText(rows[1].children[2]), /体积未知.*源站未提供可靠大小/);
+    assert.match(visibleText(rows[2].children[2]), /范围响应头/);
+    assert.match(visibleText(rows[2].children[2]), /时长 22:50/);
+  });
+  if (smartFailures.length) throw new Error(smartFailures.join('\n'));
+  console.log('前端契约验证通过：中文错误、令牌恢复、全规则智能搜索、模式提交、模型门槛、预选状态、规格可信度、评分空值、安全链接与任务恢复。');
 }
 
 run().catch((error) => { console.error(error); process.exitCode = 1; });

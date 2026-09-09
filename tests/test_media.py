@@ -59,7 +59,24 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(result["codec"], "hevc")
         self.assertEqual(result["color_transfer"], "smpte2084")
         self.assertIsNone(result["bitrate"])
+        self.assertEqual(result.get("audio_bitrate"), 128000)
+        self.assertEqual(result.get("container_bitrate"), 4567000)
+        self.assertEqual(result.get("audio_streams"), 1)
         self.assertAlmostEqual(result["fps"], 23.976)
+
+    def test_metadata_counts_all_audio_streams_without_mislabeling_first_rate(self):
+        output = """Duration: 00:01:00.00, bitrate: 4000 kb/s
+Stream #0:0: Video: h264, yuv420p, 1920x1080, 24 fps
+Stream #0:1: Audio: aac, 48000 Hz, stereo, 128 kb/s
+Stream #0:2: Audio: aac, 48000 Hz, stereo, 256 kb/s
+"""
+        result = self.media._parse_metadata(output)
+        self.assertEqual(result.get("audio_streams"), 2)
+        self.assertEqual(result["audio_bitrate"], 128000)
+        self.assertIsNone(result["bitrate"])
+        silent = self.media._parse_metadata("Duration: 00:01:00.00\nStream #0:0: Video: h264, yuv420p, 640x360\n")
+        self.assertEqual(silent.get("audio_streams"), 0)
+        self.assertIsNone(silent["audio_bitrate"])
 
     def test_unknown_metadata_stays_none_and_live_duration_is_rejected(self):
         result = self.media._parse_metadata("Duration: 00:01:00.00\nStream #0:0: Video: h264, yuv420p, 640x360\n")

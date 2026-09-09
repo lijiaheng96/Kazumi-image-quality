@@ -119,7 +119,7 @@ class AnalysisPipeline:
             self.publish(progress=38+round(self.completed/max(1,len(self.rows))*58),
                          message=f'已处理 {self.completed}/{len(self.rows)} 条线路 · 最多两路并发')
 
-    def run(self):
+    def collect_sources(self):
         from .jobs import choose_episode, error_message
         sources=[]
         self.publish(message='并行获取线路和集数')
@@ -176,6 +176,10 @@ class AnalysisPipeline:
                 if item:
                     item['index']=pending[future]
                     ready.append(item)
+        return ready
+
+    def run(self):
+        ready=self.collect_sources()
         if self.job.cancel.is_set():
             return
         if len({item['row']['site'] for item in ready})<2:

@@ -12,7 +12,11 @@ _FIELDS = {'id', 'kind', 'status', 'message', 'progress', 'results', 'errors', '
            'title', 'episode', 'score', 'rank', 'samples', 'best_road', 'resolution', 'codec',
            'bitrate', 'timings', 'elapsed_seconds', 'started_at', 'mode', 'stage', 'seconds',
            'at_seconds', 'events', 'job', 'finished_at', 'cached', 'diagnostic_error', 'refresh_count', 'alignment', 'position', 'method',
-           'matched', 'reference_times', 'candidate_times', 'distances'}
+           'matched', 'reference_times', 'candidate_times', 'distances',
+           'fps', 'duration', 'size_bytes', 'size_kind', 'size_source', 'size_confidence', 'size_note',
+           'average_bitrate', 'bitrate_scope', 'peak_bitrate', 'sampled_segments', 'spec_bitrate',
+           'spec_bitrate_kind', 'bits_per_frame', 'shortlist_rank', 'selection_status', 'selection_reason',
+           'selection_summary', 'highest_resolution', 'shortlist_count', 'searched_rule_ids', 'backup_attempts'}
 
 
 def redact(value):

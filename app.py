@@ -37,7 +37,7 @@ class AnalyzeInput(BaseModel):
     search_job_id: str
     candidate_ids: list[str] = Field(min_length=2, max_length=100)
     episode: float | None = Field(default=None, ge=0, le=100000)
-    mode: Literal['fast', 'full'] = 'fast'
+    mode: Literal['smart', 'fast', 'full'] = 'smart'
 
 
 def create_app(data_dir: Path | None = None):

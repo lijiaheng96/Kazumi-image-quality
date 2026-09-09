@@ -23,7 +23,7 @@
           <button id="save-config" class="button secondary full-width" type="submit">保存并读取规则</button>
           <p class="footnote">仅读取规则，不改动 Kazumi 的配置。</p>
         </form></details>
-        <div class="rule-toolbar"><span>勾选要搜索的网站</span><button id="toggle-rules" class="text-button" type="button">全选</button></div>
+        <div class="rule-toolbar"><span id="rule-selection-hint">智能模式搜索全部规则</span><button id="toggle-rules" class="text-button" type="button">全选</button></div>
         <div id="rule-list" class="rule-list"><p class="helper-text">正在读取规则…</p></div>
       </section>
       <section class="side-section model-section">
@@ -33,11 +33,11 @@
         <button id="refresh-config" class="text-button" type="button">重新检查环境</button>
         </div></details>
       </section>
-      <div class="sidebar-note"><span class="note-mark" aria-hidden="true">i</span><p>先匹配共同画面，再估计画质。分辨率只是画面规格，低分辨率来源也会参与比较。</p></div>
+      <div class="sidebar-note"><span class="note-mark" aria-hidden="true">i</span><p>智能比较先保留最高分辨率，按规格预选前三站，再由模型比较共同画面。体积与码率用于预选，最终名次来自模型评分。</p></div>
     </aside>
 
     <main>
-      <header class="page-header"><div><p class="eyebrow">画质检测工作台</p><h1>为同一部番剧，找到更好的画面</h1><p class="page-intro">搜索来源，确认同季同集，再按共同画面的实际评分比较。</p></div><span class="badge neutral desktop-label">本地处理 · 源站播放</span></header>
+      <header class="page-header"><div><p class="eyebrow">画质检测工作台</p><h1>为同一部番剧，找到更好的画面</h1><p class="page-intro">搜索全部规则，确认同季同集，先筛规格，再比较共同画面。</p></div><span class="badge neutral desktop-label">本地处理 · 源站播放</span></header>
       <div id="notice" class="notice" role="alert" hidden></div>
       <section class="panel search-panel" aria-labelledby="search-heading">
         <div class="step-heading"><span class="step-number" aria-hidden="true">1</span><h2 id="search-heading">搜索番剧</h2><span class="step-description">从已选网站查找</span></div>
@@ -51,12 +51,13 @@
         <div id="candidate-empty" class="empty-state compact"><div class="empty-search" aria-hidden="true"><span></span><span></span><span></span></div><h3>先搜索想看的番剧</h3><p>每个网站选择同一季的一个条目，至少选择两个网站。</p></div>
         <div id="candidates" class="candidates"></div>
         <div id="search-errors" class="errors-list" hidden></div>
-        <div class="analysis-controls"><div class="episode-field"><label for="episode">检测集数 <span>可选</span></label><input id="episode" type="number" min="0" max="100000" step="any" inputmode="decimal" placeholder="自动选择共同集数" aria-describedby="episode-hint"><p id="episode-hint" class="helper-text">留空自动选择共同集数，支持 0 与小数。</p></div><div class="episode-field"><label for="mode">检测方式</label><select id="mode" aria-describedby="mode-hint"><option value="fast">快速比较 · 3 组共同画面</option><option value="full">完整比较 · 4 组共同画面</option></select><p id="mode-hint" class="helper-text">都保留低分辨率来源；分数接近时可完整复测。</p></div><button id="analyze-button" class="button primary" type="button" disabled>开始画质检测<span aria-hidden="true">→</span></button></div>
+        <div class="analysis-controls"><div class="episode-field"><label for="episode">检测集数 <span>可选</span></label><input id="episode" type="number" min="0" max="100000" step="any" inputmode="decimal" placeholder="自动选择共同集数" aria-describedby="episode-hint"><p id="episode-hint" class="helper-text">留空自动选择共同集数，支持 0 与小数。</p></div><div class="episode-field"><label for="mode">检测方式</label><select id="mode" aria-describedby="mode-hint"><option value="smart" selected>智能比较 · 最高分辨率前三站</option><option value="fast">全来源模型快速 · 3 组共同画面</option><option value="full">全来源模型完整 · 4 组共同画面</option></select><p id="mode-hint" class="helper-text">先保留最高分辨率，按规格预选最多 3 个网站，再取共同画面交给模型比较。</p></div><button id="analyze-button" class="button primary" type="button" disabled>开始画质检测<span aria-hidden="true">→</span></button></div>
       </section>
 
       <section class="panel results-panel" aria-labelledby="results-heading"><div class="panel-heading"><div class="step-heading"><span class="step-number" aria-hidden="true">3</span><h2 id="results-heading">画质排行</h2></div><span class="badge experimental">实验性估计</span></div>
         <dl class="result-metrics" aria-label="本次检测概览"><div><dt>参与网站</dt><dd id="metric-sites">—</dd></div><div><dt>可比较网站</dt><dd id="metric-ranked">—</dd></div><div><dt>本次耗时</dt><dd id="metric-time">—</dd></div></dl>
         <p id="results-summary" class="result-explanation">只有匹配到足够共同画面的来源才参与排名。数值越高，模型估计的画质越好。</p>
+        <div id="shortlist-summary" class="shortlist-summary" aria-live="polite" hidden></div>
         <div id="results-empty" class="empty-state"><div class="filmstrip" aria-hidden="true"><span></span><span></span><span></span><span></span></div><h3>等待第一次检测</h3><p>选择来源后开始检测，在这里查看线路、画面规格与实际评分。</p></div>
         <div id="results-table-wrap" class="table-wrap" hidden><table><caption class="visually-hidden">各网站线路的画质检测结果与处理状态</caption><thead><tr><th scope="col">排名</th><th scope="col">来源 / 线路</th><th scope="col">画面规格</th><th scope="col">画质估计</th><th scope="col">过程与样本</th><th scope="col">播放页</th></tr></thead><tbody id="results-body"></tbody></table></div>
         <div id="analysis-errors" class="errors-list" hidden></div>

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class ApiTests(unittest.TestCase):
@@ -48,6 +49,45 @@ class ApiTests(unittest.TestCase):
         response=self.client.post('/api/analyze',json={'search_job_id':'x','candidate_ids':['a','b'],'mode':'unknown'},
                                   headers={'X-Local-Token':self.token})
         self.assertEqual(response.status_code,422)
+
+    def test_analysis_defaults_to_smart_and_keeps_legacy_modes(self):
+        from helper.jobs import Job
+        manager = self.client.app.state.manager
+        source = Job('search')
+        source.rules = [{'name':'甲'}, {'name':'乙'}]
+        source.update(status='completed', searched_rule_ids=[0, 1], results=[
+            {'id':'a', 'rule_id':0, 'site':'甲'}, {'id':'b', 'rule_id':1, 'site':'乙'},
+        ])
+        manager.jobs[source.id] = source
+        def prepared(job, all_rules, candidates, episode, mode):
+            job.update(mode=mode)
+        for supplied, expected in ((None, 'smart'), ('smart', 'smart'), ('fast', 'fast'), ('full', 'full')):
+            with self.subTest(mode=supplied), patch.object(manager, '_analyze', side_effect=prepared):
+                body = {'search_job_id':source.id, 'candidate_ids':['a', 'b']}
+                if supplied is not None:
+                    body['mode'] = supplied
+                response = self.client.post('/api/analyze', json=body, headers={'X-Local-Token':self.token})
+                self.assertEqual(response.status_code, 200, response.text)
+                result = manager.wait(response.json()['job_id'], timeout=3)
+                self.assertEqual(result['mode'], expected)
+
+    def test_default_analysis_requires_searching_all_rules(self):
+        from helper.jobs import Job
+        manager = self.client.app.state.manager
+        source = Job('search')
+        source.rules = [{'name':'甲'}, {'name':'乙'}, {'name':'丙'}]
+        source.update(status='completed', searched_rule_ids=[0, 1], results=[
+            {'id':'a', 'rule_id':0, 'site':'甲'}, {'id':'b', 'rule_id':1, 'site':'乙'},
+        ])
+        manager.jobs[source.id] = source
+        with patch.object(manager, '_analyze', side_effect=lambda *args: None):
+            response = self.client.post('/api/analyze', json={
+                'search_job_id':source.id, 'candidate_ids':['a', 'b'],
+            }, headers={'X-Local-Token':self.token})
+            if response.status_code == 200:
+                manager.wait(response.json()['job_id'], timeout=3)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn('重新搜索全部规则', response.json()['detail'])
 
     def test_restart_recovers_interrupted_record_as_interrupted(self):
         from helper.jobs import Job

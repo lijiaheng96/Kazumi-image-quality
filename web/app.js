@@ -4,6 +4,13 @@
 const $ = (id) => document.getElementById(id);
 const state = { token: '', config: null, busy: false, requesting: false, jobId: null, jobKind: null, searchJobId: null, candidates: [], selected: new Set(), selectedRules: new Set(), pollVersion: 0, cancelPending: false, externalTimer: null, restored: false };
 const statusNames = { pending: '等待处理', queued: '等待处理', running: '正在处理', resolving: '正在解析', downloading: '正在取样', sampling: '正在取样', matching: '正在匹配画面', scoring: '正在估计画质', completed: '检测完成', success: '检测完成', ok: '检测完成', failed: '检测失败', error: '检测失败', cancelled: '已取消', skipped: '未参与比较', unmatched: '内容未匹配', insufficient: '样本不足', incomparable: '未达到比较条件' };
+const modeNames = { smart: '智能比较', fast: '全来源模型快速比较', full: '全来源模型完整比较' };
+const selectionNames = { selected: '最高档保留', lower_resolution: '较低分辨率已排除', same_site: '同站其他线路', outside_top3: '未进入前三站', unavailable: '规格不可用' };
+const sizeSources = { hls_average: '播放清单平均码率', hls_byterange: '播放清单字节范围合计', segment_heads: '少量分片响应头', content_length: '文件响应头', content_range: '范围响应头', unknown: '未取得' };
+
+function currentMode() {
+  return Object.hasOwn(modeNames, $('mode').value) ? $('mode').value : 'smart';
+}
 
 function element(tag, className, value) {
   const node = document.createElement(tag);
@@ -107,19 +114,25 @@ function selectedSiteCount() {
 }
 
 function selectedRuleIds() {
-  const ids = [...state.selectedRules].map(Number);
+  const ids = currentMode() === 'smart' && state.config ? (state.config.rules || []).map(rule => Number(rule.id)) : [...state.selectedRules].map(Number);
   if (ids.some((id) => !Number.isInteger(id) || id < 0)) throw new Error('网站规则编号无效，请重新读取规则文件。');
   return ids;
 }
 
 function updateControls() {
   const locked = state.busy || state.requesting;
+  const smart = currentMode() === 'smart';
+  if (smart && state.config) state.selectedRules = new Set((state.config.rules || []).map(rule => String(rule.id)));
   for (const id of ['rules-path', 'discovered-paths', 'save-config', 'toggle-rules', 'keyword', 'episode', 'mode', 'refresh-config']) $(id).disabled = locked;
+  $('toggle-rules').disabled = locked || smart;
   $('search-button').disabled = locked || !state.config || !state.selectedRules.size;
   $('analyze-button').disabled = locked || !state.searchJobId || selectedSiteCount() < 2 || !state.config?.model_ready;
   $('cancel-button').disabled = !state.jobId || state.cancelPending || state.requesting;
-  document.querySelectorAll('#rule-list input, #candidates input').forEach((input) => { input.disabled = locked; });
+  document.querySelectorAll('#rule-list input').forEach((input) => { input.disabled = locked || smart; if (smart) input.checked = true; });
+  document.querySelectorAll('#candidates input').forEach((input) => { input.disabled = locked; });
   $('toggle-rules').textContent = state.config?.rules?.length && state.selectedRules.size === state.config.rules.length ? '取消全选' : '全选';
+  $('rule-selection-hint').textContent = smart ? '智能模式搜索全部规则' : '勾选要搜索的网站';
+  $('mode-hint').textContent = smart ? '先保留最高分辨率，按规格预选最多 3 个网站，再取共同画面交给模型比较。' : `${currentMode() === 'full' ? '4' : '3'} 组共同画面；保留不同分辨率来源，全部参与模型比较。`;
   $('selection-summary').textContent = state.candidates.length ? `已选 ${selectedSiteCount()} 个网站 · 至少选择两个` : '每个网站选择一个条目';
 }
 
@@ -131,6 +144,8 @@ function clearAnalysis() {
   $('results-empty').querySelector('p').textContent = '选择来源后开始检测，在这里查看线路、画面规格与实际评分。';
   $('analysis-errors').replaceChildren();
   $('analysis-errors').hidden = true;
+  $('shortlist-summary').replaceChildren();
+  $('shortlist-summary').hidden = true;
   $('results-summary').textContent = '只有匹配到足够共同画面的来源才参与排名。数值越高，模型估计的画质越好。';
   for (const id of ['metric-sites','metric-ranked','metric-time']) if ($(id)) $(id).textContent = '—';
 }
@@ -316,6 +331,27 @@ async function copyUrl(url, button) {
   } catch { notify('无法自动复制链接，请右键“打开”并选择复制链接地址。'); }
 }
 
+function renderFormat(result) {
+  const cell = element('td');
+  cell.append(element('div', 'mono', result.resolution || '未取得'), element('div', 'cell-detail', result.codec || '编码未知'));
+  const positive = value => typeof value === 'number' && Number.isFinite(value) && value > 0;
+  cell.append(element('div', 'cell-detail', positive(result.fps) ? `${Number(result.fps.toFixed(2))} fps` : '帧率未知'));
+  cell.append(element('div', 'cell-detail', positive(result.bitrate) ? `视频码率 ${(result.bitrate / 1000000).toFixed(2)} Mbps` : '视频码率未知'));
+  if (positive(result.average_bitrate)) cell.append(element('div', 'cell-detail', `总码率 ${(result.average_bitrate / 1000000).toFixed(2)} Mbps`));
+  if (positive(result.size_bytes) && ['exact', 'estimated'].includes(result.size_kind)) {
+    const unit = result.size_bytes >= 1000000000 ? 'GB' : 'MB';
+    const size = (result.size_bytes / (unit === 'GB' ? 1000000000 : 1000000)).toFixed(unit === 'GB' ? 2 : 1);
+    cell.append(element('div', 'cell-detail size-value', `${result.size_kind === 'exact' ? '已知' : '估算'}体积 ${size} ${unit}`));
+    if (result.size_source) cell.append(element('div', 'cell-detail', `体积来源：${sizeSources[result.size_source] || result.size_source}`));
+  } else cell.append(element('div', 'cell-detail', '体积未知'));
+  if (result.size_note) cell.append(element('div', 'cell-detail', result.size_note));
+  if (positive(result.duration)) {
+    const seconds = Math.floor(result.duration);
+    cell.append(element('div', 'cell-detail', `时长 ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`));
+  }
+  return cell;
+}
+
 function renderAnalysis(job) {
   const results = Array.isArray(job.results) ? [...job.results] : [];
   const rankValue = (result) => typeof result.rank === 'number' && Number.isFinite(result.rank) && result.rank > 0 ? result.rank : Infinity;
@@ -329,9 +365,12 @@ function renderAnalysis(job) {
     rankCell.append(element('span', `rank${result.rank === 1 ? ' first' : ''}`, ranked ? result.rank : '—'));
     const sourceCell = element('td');
     sourceCell.append(element('div', 'result-site', result.site || '未知网站'), element('div', 'cell-detail', result.title || ''), element('div', 'cell-detail', `${result.road || '默认线路'}${result.episode != null ? ` · 第 ${result.episode} 集` : ''}`));
-    const formatCell = element('td');
-    formatCell.append(element('div', 'mono', result.resolution || '未取得'), element('div', 'cell-detail', result.codec || '编码未知'));
-    formatCell.append(element('div', 'cell-detail', Number.isFinite(result.bitrate) && result.bitrate > 0 ? `${(result.bitrate / 1000000).toFixed(2)} Mbps` : '码率未提供'));
+    const selection = Object.hasOwn(selectionNames, result.selection_status) ? result.selection_status : null;
+    if (selection) {
+      const place = selection === 'selected' && Number.isInteger(result.shortlist_rank) && result.shortlist_rank > 0 ? ` · 预选第 ${result.shortlist_rank}` : '';
+      sourceCell.append(element('div', `selection-badge ${selection === 'selected' ? 'selected' : 'excluded'}`, `${selectionNames[selection]}${place}`));
+    }
+    const formatCell = renderFormat(result);
     const scoreCell = element('td');
     const scored = typeof result.score === 'number' && Number.isFinite(result.score);
     scoreCell.append(element('div', scored ? 'score' : 'score missing', scored ? result.score.toFixed(2) : '未评分'));
@@ -340,6 +379,7 @@ function renderAnalysis(job) {
     const status = typeof result.status === 'string' ? result.status : '';
     const statusClass = ['failed', 'error', '未参与排名', '检测失败'].includes(status) ? 'failed' : ['completed', 'success', 'ok', '已完成', '已检测'].includes(status) ? 'completed' : '';
     processCell.append(element('div', `status-label ${statusClass}`, statusNames[status] || (/[\u3400-\u9fff]/.test(status) ? status : '处理中')));
+    if (result.selection_reason) processCell.append(element('div', 'cell-detail', result.selection_reason));
     if (result.samples != null) processCell.append(element('div', 'cell-detail', `有效样本：${Array.isArray(result.samples) ? result.samples.length : result.samples}`));
     if (result.message) processCell.append(element('div', 'cell-detail', result.message));
     if (Number.isFinite(result.stage_elapsed_seconds)) processCell.append(element('div', 'cell-detail', `本阶段已用 ${Math.max(0,result.stage_elapsed_seconds).toFixed(1)} 秒`));
@@ -369,8 +409,18 @@ function renderAnalysis(job) {
   const rankedCount = results.filter((result) => typeof result.rank === 'number' && result.rank > 0).length;
   const episode = job.episode != null ? `第 ${job.episode} 集 · ` : '';
   const timing = Number.isFinite(job.elapsed_seconds) ? ` · 耗时 ${job.elapsed_seconds.toFixed(1)} 秒` : '';
-  const mode = job.mode ? `${job.mode === 'full' ? '完整' : '快速'}比较 · ` : '';
+  const mode = modeNames[job.mode] ? `${modeNames[job.mode]} · ` : '';
   $('results-summary').textContent = `${mode}${episode}${results.length} 条线路${rankedCount ? `，${rankedCount} 条参与排名` : '，尚无可比较排名'}${timing}。画质估计不是百分制；未评分不代表画质为零。`;
+  const shortlist = $('shortlist-summary');
+  shortlist.replaceChildren();
+  shortlist.hidden = job.mode !== 'smart';
+  if (job.mode === 'smart') {
+    const resolution = job.highest_resolution ? `最高档 ${job.highest_resolution}` : '正在读取各线路分辨率';
+    const count = Number.isInteger(job.shortlist_count) && job.shortlist_count >= 0 ? ` · 入选 ${job.shortlist_count} 个网站` : '';
+    shortlist.append(element('strong', 'selection-headline', `${resolution}${count}`));
+    shortlist.append(element('p', '', job.selection_summary || '排除低分辨率后，按规格预选最多 3 个不同网站；每站保留一条线路。'));
+    shortlist.append(element('p', 'selection-footnote', '预选序号只表示规格筛选顺序，最终画质名次以入选来源的共同画面模型评分为准。'));
+  }
   if ($('metric-sites')) $('metric-sites').textContent = String(new Set(results.map(row => row.site)).size);
   if ($('metric-ranked')) $('metric-ranked').textContent = String(new Set(results.filter(row => row.rank > 0).map(row => row.site)).size);
   if ($('metric-time')) $('metric-time').textContent = Number.isFinite(job.elapsed_seconds) ? `${job.elapsed_seconds.toFixed(1)} 秒` : '—';
@@ -448,6 +498,15 @@ function startJob(id, kind) {
 }
 
 $('discovered-paths').addEventListener('change', () => { if ($('discovered-paths').value) $('rules-path').value = $('discovered-paths').value; });
+$('mode').addEventListener('change', () => {
+  if (currentMode() === 'smart' && state.searchJobId) {
+    clearSearch();
+    $('candidate-empty').querySelector('h3').textContent = '重新搜索全部规则';
+    $('candidate-empty').querySelector('p').textContent = '智能模式需要全部规则的搜索结果，请重新搜索番剧后比较。';
+    notify('已切换到智能比较，请重新搜索以覆盖全部规则网站。', true);
+  }
+  updateControls();
+});
 $('toggle-rules').addEventListener('click', () => {
   const selectAll = state.selectedRules.size !== (state.config?.rules || []).length;
   document.querySelectorAll('#rule-list input').forEach((input) => { input.checked = selectAll; selectAll ? state.selectedRules.add(input.value) : state.selectedRules.delete(input.value); });
@@ -495,7 +554,7 @@ $('analyze-button').addEventListener('click', async () => {
   if (episode !== undefined && (!Number.isFinite(episode) || episode < 0 || episode > 100000)) { notify('集数应为 0 至 100000 的数字，可填写小数，也可以留空自动选择。'); $('episode').focus(); return; }
   state.requesting = true; updateControls(); notify('');
   try {
-    const data = await request('/api/analyze', { search_job_id: state.searchJobId, candidate_ids: [...state.selected], mode: $('mode').value || 'fast', ...(episode !== undefined ? { episode } : {}) });
+    const data = await request('/api/analyze', { search_job_id: state.searchJobId, candidate_ids: [...state.selected], mode: currentMode(), ...(episode !== undefined ? { episode } : {}) });
     clearAnalysis(); startJob(data.job_id, 'analyze');
   } catch (error) { notify(error.message); }
   finally { state.requesting = false; updateControls(); }
