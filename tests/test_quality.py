@@ -47,6 +47,80 @@ class QualityTests(unittest.TestCase):
         self.assertIsNone(result[0].get('rank'))
         self.assertIn('不足', result[0]['message'])
 
+    def test_one_incompatible_sample_set_does_not_remove_a_valid_cross_site_group(self):
+        rows = [
+            {'site': '甲', 'scores': {0: 70, 1: 70, 2: 70, 3: 10}},
+            {'site': '乙', 'scores': {0: 60, 1: 60, 2: 60}},
+            {'site': '丙', 'scores': {1: 95, 2: 95, 3: 95}},
+        ]
+        for ordered in (rows, list(reversed(rows))):
+            with self.subTest(order=[row['site'] for row in ordered]):
+                result = self.q.rank_common(ordered)
+                self.assertEqual([(row['site'], row['score'], row['samples'])
+                                  for row in result if row['rank']], [('甲', 70, 3), ('乙', 60, 3)])
+                excluded = next(row for row in result if row['site'] == '丙')
+                self.assertIsNone(excluded['score'])
+                self.assertIn('位置', excluded['message'])
+                self.assertIn('不一致', excluded['message'])
+
+    def test_comparison_group_prioritizes_site_coverage_over_scores_and_road_count(self):
+        rows = [
+            {'site': '甲', 'scores': {0: 70, 1: 70, 2: 70, 3: 70}},
+            *[{'site': '乙', 'scores': {0: 99, 1: 99, 2: 99}} for _ in range(4)],
+            {'site': '丙', 'scores': {1: 60, 2: 60, 3: 60}},
+            {'site': '丁', 'scores': {1: 50, 2: 50, 3: 50}},
+        ]
+        ranked = [row for row in self.q.rank_common(rows) if row['rank']]
+        self.assertEqual([row['site'] for row in ranked], ['甲', '丙', '丁'])
+        self.assertTrue(all(row['samples'] == 3 for row in ranked))
+
+    def test_three_common_positions_keep_a_better_low_resolution_road_in_the_same_site(self):
+        rows = [
+            {'site': '甲', 'road': '全部', 'scores': {0: 70, 1: 70, 2: 70, 3: 10}},
+            {'site': '乙', 'road': '全部', 'scores': {0: 60, 1: 60, 2: 60, 3: 20}},
+            {'site': '甲', 'road': '低分辨率', 'width': 640, 'height': 360,
+             'scores': {0: 99, 1: 99, 2: 99}},
+        ]
+        result = self.q.rank_common(rows)
+        ranked = [row for row in result if row['rank']]
+        self.assertEqual([(row['site'], row['score'], row['samples']) for row in ranked],
+                         [('甲', 99, 3), ('甲', 70, 3), ('乙', 60, 3)])
+        self.assertTrue(next(row for row in result if row['road'] == '低分辨率')['best_road'])
+
+    def test_all_four_positions_are_used_when_every_eligible_road_supports_them(self):
+        result = self.q.rank_common([
+            {'site': '甲', 'scores': {0: 70, 1: 70, 2: 70, 3: 10}},
+            {'site': '乙', 'scores': {0: 60, 1: 60, 2: 60, 3: 20}},
+        ])
+        self.assertEqual([(row['site'], row['score'], row['samples']) for row in result],
+                         [('甲', 55, 4), ('乙', 50, 4)])
+
+    def test_equal_site_and_position_coverage_prefers_more_valid_roads(self):
+        rows = [
+            {'site': '甲', 'scores': {0: 70, 1: 70, 2: 70, 3: 70}},
+            {'site': '乙', 'scores': {0: 99, 1: 99, 2: 99}},
+            {'site': '丙', 'road': '一', 'scores': {1: 60, 2: 60, 3: 60}},
+            {'site': '丙', 'road': '二', 'scores': {1: 50, 2: 50, 3: 50}},
+        ]
+        ranked = [row for row in self.q.rank_common(rows) if row['rank']]
+        self.assertEqual([row['site'] for row in ranked], ['甲', '丙', '丙'])
+        self.assertEqual([row['rank'] for row in ranked], [1, 2, 2])
+
+    def test_invalid_model_scores_do_not_change_the_valid_comparison_group(self):
+        for invalid in (float('nan'), float('inf'), None, '无效'):
+            with self.subTest(invalid=invalid):
+                rows = [
+                    {'site': '甲', 'scores': {0: 70, 1: 70, 2: 70, 3: 10}},
+                    {'site': '乙', 'scores': {0: 60, 1: 60, 2: 60, 3: 20}},
+                    {'site': '丙', 'scores': {1: 50, 2: 50, 3: invalid}},
+                ]
+                result = self.q.rank_common(rows)
+                self.assertEqual([(row['site'], row['samples']) for row in result if row['rank']],
+                                 [('甲', 4), ('乙', 4)])
+                excluded = next(row for row in result if row['site'] == '丙')
+                self.assertIsNone(excluded['rank'])
+                self.assertIn('无效分数', excluded['message'])
+
     def test_equal_scores_have_equal_rank(self):
         scores = {0:70,1:60,2:80}
         rows = self.q.rank_common([{'site':'甲','scores':scores},{'site':'乙','scores':scores}])

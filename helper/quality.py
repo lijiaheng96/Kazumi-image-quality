@@ -57,26 +57,53 @@ def best_match(reference: str, candidates: list[dict], max_distance: float = .12
 
 
 def rank_common(rows: list[dict]) -> list[dict]:
-    """仅在相同三个以上取样位置比较；失败结果不参与排序。"""
+    """选择网站覆盖最多的共同取样组；组内始终比较相同的至少三个位置。"""
+    from itertools import combinations
+
     output = [{**row, 'score': None, 'rank': None} for row in rows]
-    eligible = [row for row in output if len(row.get('scores', {})) >= 3]
+    eligible = []
     for row in output:
-        if row not in eligible:
+        row.pop('samples', None)
+        row.pop('best_road', None)
+        scores = row.get('scores', {})
+        if len(scores) < 3:
             row.setdefault('message', '共同内容不足三个位置，未参与排名')
+            continue
+        try:
+            valid = all(math.isfinite(float(value)) for value in scores.values())
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            row['message'] = '模型返回无效分数，未参与排名'
+            continue
+        eligible.append(row)
     if len({row['site'] for row in eligible}) < 2:
         for row in eligible:
             row['message'] = '可比较网站不足两个，无法生成跨站排名'
         return output
-    common = set.intersection(*(set(row['scores']) for row in eligible))
-    if len(common) < 3:
+
+    # 当前每条线路最多四个位置，枚举共同子集避免一个缺帧来源拖掉所有结果。
+    # 只按网站数、有效线路数、位置数和位置键序选择，不参考分数或分辨率。
+    candidates = set()
+    for row in eligible:
+        keys = sorted(row['scores'])
+        for size in range(3, len(keys) + 1):
+            candidates.update(combinations(keys, size))
+    groups = []
+    for keys in candidates:
+        members = [row for row in eligible if set(keys).issubset(row['scores'])]
+        groups.append(((-len({row['site'] for row in members}), -len(members), -len(keys), keys), members))
+    selection, members = min(groups, key=lambda group: group[0])
+    common = selection[3]
+    if -selection[0] < 2:
         for row in eligible:
-            row['message'] = '所有来源的共同内容不足三个位置，未参与排名'
+            row['message'] = '各来源的共同取样位置不一致，未形成至少两个网站的三位置比较组'
         return output
     for row in eligible:
-        values = [float(row['scores'][key]) for key in sorted(common)]
-        if not all(math.isfinite(value) for value in values):
-            row['message'] = '模型返回无效分数，未参与排名'
+        if not set(common).issubset(row['scores']):
+            row['message'] = '与本次比较组的共同取样位置不一致，未参与排名'
             continue
+        values = [float(row['scores'][key]) for key in common]
         row['score'] = round(sum(values) / len(values), 2)
         row['samples'] = len(common)
         row['message'] = f'基于 {len(common)} 组共同画面的实验性估计；分数越高，模型预测画质越好'

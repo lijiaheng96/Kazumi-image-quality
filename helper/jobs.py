@@ -12,8 +12,6 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PIL import Image
-
 from . import quality
 from .diagnostics import Diagnostics, redact
 from .matching import same_title
@@ -222,55 +220,28 @@ class JobManager:
 
     @staticmethod
     def _reference_frames(media, resolved, metadata, directory, cancel, positions=4):
+        from .alignment import sequence_matches
         refs = {}
         for key, fraction in enumerate((.22, .42, .62, .80)):
-            start = metadata['duration'] * fraction
-            frames = media.capture_frames(resolved, [start, start+.5, start+1], directory/f'ref-{key}', cancel)
-            if len(frames) == 3:
-                with Image.open(frames[0]['path']) as image:
-                    if quality.usable_frame(image):
-                        refs[key] = frames
-                        if len(refs) >= positions:
-                            break
+            # 避开局部淡入淡出；三个参考画面必须都满足后续一致的校验要求。
+            for shift in (0, 2, 5):
+                start = metadata['duration'] * fraction + shift
+                if start + 1 >= metadata['duration']:
+                    continue
+                frames = media.capture_frames(resolved, [start, start+.5, start+1], directory/f'ref-{key}-{shift}', cancel)
+                if sequence_matches(frames, frames):
+                    refs[key] = frames
+                    break
+            if len(refs) >= positions:
+                break
         return refs
 
     @staticmethod
-    def _align_frames(media, resolved, metadata, reference, directory, cancel):
-        aligned = {}
-        offset = 0.
-        for key, refs in reference['frames'].items():
-            base = refs[0]['time']
-            estimated = max(0., min(metadata['duration']-2, base+offset))
-            frames = media.capture_frames(resolved, [estimated,estimated+.5,estimated+1], directory/f'direct-{key}', cancel)
-            if not JobManager._sequence_matches(refs, frames):
-                # 在局部窗口中找同一场景，逐段更新偏移；不把时长比例当内容对齐。
-                start = max(0., estimated-40)
-                duration = min(82., metadata['duration']-start-1)
-                coarse = media.capture_sequence(resolved, start, duration, 1., directory/f'coarse-{key}', cancel, width=192)
-                match = quality.best_match(refs[0]['path'], coarse)
-                if match is None:
-                    continue
-                fine_start = max(0., match['time']-.75)
-                fine = media.capture_sequence(resolved, fine_start, 1.75, .125, directory/f'fine-{key}', cancel, width=192)
-                match = quality.best_match(refs[0]['path'], fine)
-                if match is None:
-                    continue
-                found = match['time']
-                frames = media.capture_frames(resolved, [found,found+.5,found+1], directory/f'aligned-{key}', cancel)
-                if not JobManager._sequence_matches(refs, frames):
-                    continue
-            offset = frames[0]['time'] - base
-            aligned[key] = frames
-        return aligned
+    def _align_frames(media, resolved, metadata, reference, directory, cancel, trace=None):
+        from .alignment import align_frames
+        return align_frames(media, resolved, metadata, reference, directory, cancel, trace)
 
     @staticmethod
     def _sequence_matches(refs, frames):
-        if len(refs) != 3 or len(frames) != 3:
-            return False
-        distances = []
-        for ref, frame in zip(refs, frames):
-            with Image.open(ref['path']) as a, Image.open(frame['path']) as b:
-                if not quality.usable_frame(a) or not quality.usable_frame(b):
-                    return False
-                distances.append(quality.fingerprint_distance(a, b))
-        return max(distances) <= .12 and sum(distances)/3 <= .08
+        from .alignment import sequence_matches
+        return sequence_matches(refs, frames)

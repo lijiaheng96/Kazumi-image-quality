@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import media, quality, rules
+from .media_session import MediaSession
 
 
 class AnalysisPipeline:
@@ -59,6 +60,7 @@ class AnalysisPipeline:
         try:
             with self.stage(row, '解析'):
                 resolved = media.resolve_media(row['page_url'],self.rules[source['rule_id']],self.job.cancel)
+                resolved_at = time.monotonic()
             with self.stage(row, '规格探测'):
                 metadata = media.probe(resolved,self.job.cancel)
             if metadata['duration'] <= 15:
@@ -68,7 +70,12 @@ class AnalysisPipeline:
             self.set_row(row, resolution=f'{metadata["width"]} × {metadata["height"]}',
                          codec=metadata['codec'], bitrate=metadata.get('bitrate'),
                          status='等待取样', message='规格已获取，分辨率和码率不会作为淘汰门槛')
-            return {'source':source,'row':row, 'media':resolved, 'metadata':metadata}
+            session = MediaSession(media, row['page_url'], self.rules[source['rule_id']],
+                                   resolved, metadata, resolved_at,
+                                   stage=lambda: self.job.stage('链接刷新', site=row['site'], road=row['road'], row=row),
+                                   on_refresh=lambda count: self.set_row(row, refresh_count=count))
+            return {'source':source,'row':row, 'media':resolved, 'metadata':metadata,
+                    'resolved_at':resolved_at, 'session':session}
         except Exception as error:
             self.fail(row,error)
             return None
@@ -92,15 +99,18 @@ class AnalysisPipeline:
         row, metadata = item['row'], item['metadata']
         if self.job.cancel.is_set():
             return
+        trace = []
         try:
             if abs(display_aspect(metadata)/reference['aspect']-1)>.03:
                 raise ValueError('画幅比例不同，可能存在裁剪，暂不混排')
             with self.stage(row,'取样与对齐'):
-                aligned=self.manager._align_frames(media,item['media'],metadata,reference,root/str(item['index']),self.job.cancel)
+                aligned=self.manager._align_frames(item['session'],item['media'],metadata,reference,
+                                                   root/str(item['index']),self.job.cancel,trace=trace)
             self.score(row,aligned)
         except Exception as error:
             self.fail(row,error)
         finally:
+            self.set_row(row, alignment=trace)
             self.finish_row()
 
     def finish_row(self):
@@ -177,7 +187,10 @@ class AnalysisPipeline:
         unique,duplicates={},[]
         for item in ready:
             resolved=item['media']
-            key=(resolved['url'],tuple(sorted(resolved.get('headers',{}).items())))
+            specification = tuple(item['metadata'].get(name) for name in
+                                  ('width','height','codec','duration','fps','bitrate',
+                                   'color_transfer','display_aspect_ratio'))
+            key=(resolved['url'],tuple(sorted(resolved.get('headers',{}).items())),specification)
             if key in unique:
                 duplicates.append((item,unique[key]))
             else:
@@ -199,7 +212,7 @@ class AnalysisPipeline:
                 row,metadata=item['row'],item['metadata']
                 try:
                     with self.stage(row,'参考取样'):
-                        refs=self.manager._reference_frames(media,item['media'],metadata,root/str(item['index']),
+                        refs=self.manager._reference_frames(item['session'],item['media'],metadata,root/str(item['index']),
                                                            self.job.cancel, positions=3 if self.mode=='fast' else 4)
                         if len(refs)<3:
                             raise ValueError('有效正文取样不足三个位置，尝试其他参考来源')
@@ -216,7 +229,14 @@ class AnalysisPipeline:
                         future.result()
             for item,original in duplicates:
                 original_row=original['row']
-                if original_row.get('scores'):
+                if original['session'].refresh_count:
+                    # 刷新后不能沿用最初的同链假设；已有并发任务结束后逐路独立核验。
+                    if reference and not self.job.cancel.is_set():
+                        self.sample(item, reference, root)
+                        continue
+                    self.set_row(item['row'],status='未参与排名',
+                                 message='原线路已刷新链接，本次无法独立核验，未复用相同媒体的评分')
+                elif original_row.get('scores'):
                     self.set_row(item['row'],scores=copy.deepcopy(original_row['scores']),status='已检测',cached=True,
                                  message='同一媒体及请求上下文，复用本次已检测样本')
                 else:

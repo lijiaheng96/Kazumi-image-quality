@@ -11,7 +11,8 @@ from pathlib import Path
 _FIELDS = {'id', 'kind', 'status', 'message', 'progress', 'results', 'errors', 'site', 'road',
            'title', 'episode', 'score', 'rank', 'samples', 'best_road', 'resolution', 'codec',
            'bitrate', 'timings', 'elapsed_seconds', 'started_at', 'mode', 'stage', 'seconds',
-           'at_seconds', 'events', 'job', 'finished_at', 'cached', 'diagnostic_error'}
+           'at_seconds', 'events', 'job', 'finished_at', 'cached', 'diagnostic_error', 'refresh_count', 'alignment', 'position', 'method',
+           'matched', 'reference_times', 'candidate_times', 'distances'}
 
 
 def redact(value):

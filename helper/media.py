@@ -19,6 +19,14 @@ class Cancelled(Exception):
     """用户已取消当前工作。"""
 
 
+class MediaAccessError(ValueError):
+    """只暴露 HTTP 状态；签名媒体地址和请求头留在调用方内存中。"""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"源站拒绝媒体访问（HTTP {status_code}），播放地址可能已过期或当前无权访问")
+
+
 _MEDIA_SUFFIXES = (".m3u8", ".mp4", ".m4v", ".webm", ".mkv", ".mpd", ".mov", ".flv")
 _MEDIA_TYPES = ("video/", "application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml")
 _AD_PATTERN = re.compile(r"(?:^|[./_?&=-])(ads?|advert\w*|preroll|doubleclick)(?:[./_?&=-]|$)", re.I)
@@ -277,11 +285,19 @@ def _parse_metadata(output: str) -> dict:
             "bitrate": int(float(bitrate.group(1)) * 1000) if bitrate else None, "color_transfer": color_transfer}
 
 
+def _check_media_access(output: str) -> None:
+    """识别可重新解析的访问失败，避免误报为直播或缺少视频时长。"""
+    status = re.search(r"(?:HTTP error|Server returned)\s+(401|403|410)\b", output)
+    if status:
+        raise MediaAccessError(int(status.group(1)))
+
+
 def probe(media: dict, cancel: threading.Event) -> dict:
     """使用已安装的 FFmpeg 探测输入；无输出文件时返回码 1 属于正常行为。"""
     _check_cancel(cancel)
     args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostdin"] + _input_args(media)
     result = _run_process(args, cancel, timeout=35)
+    _check_media_access(result.stderr)
     return _parse_metadata(result.stderr)
 
 
@@ -309,8 +325,12 @@ def capture_frames(media: dict, times: list[float], directory: Path, cancel: thr
         for group in groups:
             _check_cancel(cancel)
             start = float(f"{group[0][1]:.6f}")
+            # HLS 分片可能从非关键帧开始，短预卷让解码器在目标前恢复参考帧。
+            # copyts 保留真实时间轴，避免把非整帧 seek 的舍入误差累加回 PTS。
+            seek_start = max(0.0, start - 5)
             args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin", "-y",
-                    "-filter_complex_threads", "2", "-threads", "2", "-ss", f"{start:.6f}"] + _input_args(media)
+                    "-filter_complex_threads", "2", "-threads", "2", "-copyts", "-start_at_zero",
+                    "-ss", f"{seek_start:.6f}"] + _input_args(media)
             graph = [f"[0:v:0]split={len(group)}" + "".join(f"[in{index}]" for index, _ in group)]
             outputs = []
             for index, timestamp in group:
@@ -318,14 +338,19 @@ def capture_frames(media: dict, times: list[float], directory: Path, cancel: thr
                 created.append(path)
                 # trim 保留原始 PTS，每支只取目标之后的首帧，兼容非整帧时间和变帧率。
                 # 必须先选择再缩放；fps 滤镜会按采样网格复制/舍入帧，不能用于精确评分。
-                graph.append(f"[in{index}]trim=start={timestamp - start:.6f},select='eq(n,0)',"
+                graph.append(f"[in{index}]trim=start={timestamp:.6f},select='eq(n,0)',"
                              f"{_SCALE},showinfo@sample{index}=checksum=0[out{index}]")
                 outputs += ["-map", f"[out{index}]", "-an", "-sn", "-frames:v", "1", "-fps_mode", "passthrough",
                             "-threads", "2", "-update", "1", str(path)]
             args += ["-filter_complex", ";".join(graph)] + outputs
             result = _run_process(args, cancel, timeout=45)
-            actual_times = {int(match.group(1)): start + float(match.group(2)) for match in re.finditer(
-                r"\[showinfo@sample(\d+)\s+@[^\]]+\]\s+n:\s*0\s+pts:\s*-?\d+\s+pts_time:([-\d.e+]+)", result.stderr)}
+            _check_media_access(result.stderr)
+            time_bases = {int(match.group(1)): int(match.group(2)) / int(match.group(3)) for match in re.finditer(
+                r"\[showinfo@sample(\d+)\s+@[^\]]+\] config in time_base: (\d+)/([1-9]\d*)", result.stderr)}
+            actual_times = {int(match.group(1)): int(match.group(2)) * time_bases[int(match.group(1))]
+                            for match in re.finditer(
+                                r"\[showinfo@sample(\d+)\s+@[^\]]+\]\s+n:\s*0\s+pts:\s*(-?\d+)", result.stderr)
+                            if int(match.group(1)) in time_bases}
             for index, timestamp in group:
                 path = directory / f"{prefix}_{index:04d}.png"
                 actual_time = actual_times.get(index)
@@ -342,7 +367,7 @@ def capture_frames(media: dict, times: list[float], directory: Path, cancel: thr
 
 def capture_sequence(media: dict, start: float, duration: float, step: float, directory: Path,
                      cancel: threading.Event, *, width: int = 1280) -> list[dict]:
-    """一次解码最多 90 秒的匹配帧；width 可缩小指纹图，时间按请求采样网格标记。"""
+    """一次解码最多 90 秒的匹配帧；time 和 actual_time 均保留真实输入帧时间。"""
     _check_cancel(cancel)
     if (not _finite_nonnegative(start) or not _finite_nonnegative(duration) or duration <= 0 or duration > 90
             or not _finite_nonnegative(step) or step <= 0 or math.ceil(duration / step) > 180):
@@ -353,17 +378,33 @@ def capture_sequence(media: dict, start: float, duration: float, step: float, di
     directory.mkdir(parents=True, exist_ok=True)
     prefix = uuid.uuid4().hex[:12]
     pattern = directory / f"{prefix}_%04d.png"
-    args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-threads", "2", "-ss", f"{start:.6f}"] + _input_args(media)
+    seek_start = max(0.0, float(f"{start:.6f}") - 5)
+    args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin", "-y",
+            "-threads", "2", "-copyts", "-start_at_zero", "-ss", f"{seek_start:.6f}"] + _input_args(media)
     scale = f"scale=w='min({width},iw*sar)':h='max(1,round(ih*min(1,{width}/(iw*sar))))',setsar=1"
-    args += ["-t", f"{duration:.6f}", "-map", "0:v:0", "-an", "-sn", "-vf", f"fps=1/{step:.8f}," + scale,
-             "-frames:v", str(math.ceil(duration / step)), "-threads", "2", str(pattern)]
+    # 每个采样区间只保留首个真实帧；稀疏 VFR 留空而不复制画面，也不改写 PTS。
+    # fps 滤镜会选择网格附近画面并重写时间，后续按标签精确回取时就会变成别帧。
+    select = (f"select='isnan(prev_selected_t)+gt(floor((t-{start:.6f})/{step:.8f}),"
+              f"floor((prev_selected_t-{start:.6f})/{step:.8f}))'")
+    args += ["-map", "0:v:0", "-an", "-sn", "-vf",
+             f"trim=start={start:.6f}:end={start + duration:.6f},{select},{scale},showinfo@sequence=checksum=0",
+             "-fps_mode", "passthrough", "-frames:v", str(math.ceil(duration / step)), "-threads", "2", str(pattern)]
     try:
         result = _run_process(args, cancel, timeout=120)
+        _check_media_access(result.stderr)
         paths = sorted(directory.glob(f"{prefix}_*.png"))
-        if result.returncode or not paths:
+        time_base = re.search(r"\[showinfo@sequence\s+@[^\]]+\] config in time_base: (\d+)/(\d+)", result.stderr)
+        timestamps = re.findall(r"\[showinfo@sequence\s+@[^\]]+\]\s+n:\s*(\d+)\s+pts:\s*(-?\d+)", result.stderr)
+        if result.returncode or not paths or not time_base or int(time_base.group(2)) == 0 or len(timestamps) != len(paths):
             raise ValueError("批量提帧失败，视频可能无法定位或源站拒绝读取")
-        return [{"time": float(start + index * step), "path": str(path.resolve())} for index, path in enumerate(paths)]
+        tick = int(time_base.group(1)) / int(time_base.group(2))
+        frames = []
+        for index, ((number, pts), path) in enumerate(zip(timestamps, paths)):
+            actual_time = int(pts) * tick
+            if int(number) != index or not math.isfinite(actual_time) or not path.stat().st_size:
+                raise ValueError("批量提帧失败，无法确认真实帧时间")
+            frames.append({"time": actual_time, "actual_time": actual_time, "path": str(path.resolve())})
+        return frames
     except BaseException:
         for path in directory.glob(f"{prefix}_*.png"):
             path.unlink(missing_ok=True)
