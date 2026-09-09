@@ -74,6 +74,20 @@ class MediaTests(unittest.TestCase):
         result = self.media._parse_metadata("Duration: 00:01:00.00\nStream #0:0: Video: hevc, yuv420p(tv, bt2020nc/bt2020/unknown), 640x360\n")
         self.assertIsNone(result["color_transfer"])
 
+    def test_metadata_uses_display_aspect_ratio_for_anamorphic_video(self):
+        cases = [
+            ("720x480 [SAR 32:27 DAR 16:9]", 16 / 9),
+            ("720x576 [SAR 16:15]", 4 / 3),
+            ("720x480 [DAR 16:9]", 16 / 9),
+            ("1920x1080", 16 / 9),
+            ("720x480 [SAR 0:1 DAR 0:0]", 3 / 2),
+        ]
+        for video_format, expected in cases:
+            with self.subTest(video_format=video_format):
+                output = f"Duration: 00:02:00.00\nStream #0:0: Video: h264, yuv420p, {video_format}, 23.98 fps"
+                result = self.media._parse_metadata(output)
+                self.assertAlmostEqual(result.get("display_aspect_ratio", 0), expected)
+
     def test_probe_real_fixture(self):
         result = self.media.probe({"url": str(self.video), "headers": {}}, self.cancel)
         self.assertAlmostEqual(result["duration"], 4, places=1)
@@ -94,6 +108,110 @@ class MediaTests(unittest.TestCase):
                                              self.folder / "批量中文提帧", self.cancel)
         self.assertEqual([frame["time"] for frame in frames], [0.25, 0.75, 1.25, 1.75])
         self.assertTrue(all(Path(frame["path"]).is_file() for frame in frames))
+
+    def test_adjacent_frames_share_one_http_input(self):
+        received = []
+        video_bytes = self.video.read_bytes()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                received.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(len(video_bytes)))
+                self.end_headers()
+                try:
+                    self.wfile.write(video_bytes)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            frames = self.media.capture_frames(
+                {"url": f"http://127.0.0.1:{server.server_port}/film.mp4"}, [0.5, 1, 1.5],
+                self.folder / "合并HTTP读取", self.cancel)
+            self.assertEqual(len(frames), 3)
+            self.assertEqual(received, ["/film.mp4"], "相邻采样应共用一次媒体读取")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=3)
+
+    def test_frame_capture_reports_real_vfr_timestamps_and_preserves_order(self):
+        video = self.folder / "变帧率.mkv"
+        subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=10:duration=4",
+             "-vf", "select='eq(n,0)+eq(n,1)+eq(n,6)+eq(n,7)+eq(n,11)+eq(n,18)+eq(n,22)+eq(n,30)'",
+             "-fps_mode", "vfr", "-c:v", "ffv1", str(video)],
+            check=True, capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # 请求间隔为 0.5 秒；实际视频只有这些离散时间戳，不能用 fps 人工补帧。
+        frames = self.media.capture_frames({"url": str(video)}, [1.03, 0.03, 0.53, 0.53],
+                                          self.folder / "变帧率输出", self.cancel)
+        self.assertEqual([frame["time"] for frame in frames], [1.03, 0.03, 0.53, 0.53])
+        self.assertEqual([round(frame.get("actual_time", -1), 3) for frame in frames], [1.1, 0.1, 0.6, 0.6])
+        for index, source_index in enumerate((4, 1, 2, 2)):
+            expected = self.folder / f"变帧率基准_{index}.png"
+            subprocess.run(
+                [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(video), "-vf", f"select='eq(n,{source_index})'", "-frames:v", "1", str(expected)],
+                check=True, capture_output=True, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with Image.open(frames[index]["path"]) as actual, Image.open(expected) as reference:
+                self.assertEqual(actual.size, (320, 180), "评分帧不得放大低分辨率来源")
+                self.assertIsNone(ImageChops.difference(actual, reference).getbbox())
+
+    def test_sequence_fingerprint_width_is_optional_and_preserves_aspect_ratio(self):
+        frames = self.media.capture_sequence({"url": str(self.video)}, 0.25, 2, 0.5,
+                                             self.folder / "小尺寸指纹", self.cancel, width=192)
+        self.assertEqual([frame["time"] for frame in frames], [0.25, 0.75, 1.25, 1.75])
+        for frame in frames:
+            with Image.open(frame["path"]) as image:
+                self.assertEqual(image.size, (192, 108))
+
+    def test_fractional_frame_rate_matches_independent_exact_seeks(self):
+        video = self.folder / "非整数帧率.mp4"
+        subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24000/1001:duration=4",
+             "-c:v", "libx264", "-preset", "ultrafast", str(video)],
+            check=True, capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        requested = [0.031, 0.531, 1.031]
+        frames = self.media.capture_frames({"url": str(video)}, requested,
+                                          self.folder / "非整数帧率输出", self.cancel)
+        # 23.976 fps 的第 1、13、25 帧；相邻实际 PTS 间隔为 0.5005 秒。
+        for index, expected_pts in enumerate((1001 / 24000, 13013 / 24000, 25025 / 24000)):
+            self.assertAlmostEqual(frames[index].get("actual_time", -1), expected_pts, places=5)
+            expected = self.folder / f"独立seek_{index}.png"
+            subprocess.run(
+                [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+                 "-ss", str(requested[index]), "-i", str(video), "-frames:v", "1", str(expected)],
+                check=True, capture_output=True, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with Image.open(frames[index]["path"]) as actual, Image.open(expected) as reference:
+                self.assertIsNone(ImageChops.difference(actual, reference).getbbox())
+
+    def test_sequence_rejects_invalid_width_before_creating_outputs(self):
+        directory = self.folder / "无效指纹宽度"
+        for width in (0, -1, 1281, 192.5, True, "192"):
+            with self.subTest(width=width):
+                with self.assertRaisesRegex(ValueError, "宽度"):
+                    self.media.capture_sequence({"url": str(self.video)}, 0, 1, 0.5,
+                                                directory, self.cancel, width=width)
+        self.assertFalse(directory.exists())
+
+    def test_incomplete_frame_batch_removes_all_outputs(self):
+        directory = self.folder / "不完整批次"
+        with self.assertRaisesRegex(ValueError, "提帧失败"):
+            self.media.capture_frames({"url": str(self.video)}, [3.5, 4.5], directory, self.cancel)
+        self.assertEqual(list(directory.glob("*.png")), [])
 
     def test_cancelled_and_invalid_requests_do_not_start_work(self):
         self.cancel.set()

@@ -11,55 +11,58 @@
 <body>
   <div class="workspace">
     <aside class="sidebar" aria-label="本地设置">
-      <a class="brand" href="/" aria-label="画质助手首页"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span><span>Kazumi<span class="brand-caption">本地画质助手</span></span></a>
-      <div class="local-label"><span class="status-dot"></span>仅在本机运行</div>
-      <section class="side-section">
-        <div class="section-heading"><h2>规则文件</h2><span id="rule-count" class="count-badge">—</span></div>
-        <p class="helper-text">连接 Kazumi 的规则文件，选择要搜索的网站。</p>
+      <div class="sidebar-brand"><a class="brand" href="/" aria-label="画质助手首页"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span><span>Kazumi<span class="brand-caption">本地画质助手</span></span></a>
+      <div class="local-label"><span class="status-dot" aria-hidden="true"></span>仅在本机运行</div></div>
+      <section class="side-section sources-section">
+        <div class="section-heading"><h2>网站来源</h2><span id="rule-count" class="count-badge">—</span></div>
+        <details class="settings-disclosure"><summary>规则文件设置<span class="disclosure-hint">路径与导入</span></summary>
         <form id="config-form">
           <label for="rules-path">规则 JSON 路径</label>
           <textarea id="rules-path" rows="3" spellcheck="false" placeholder="粘贴 plugins.json 的完整路径"></textarea>
           <div id="discovered-wrap" hidden><label for="discovered-paths">已发现的规则文件</label><select id="discovered-paths"><option value="">选择文件路径</option></select></div>
           <button id="save-config" class="button secondary full-width" type="submit">保存并读取规则</button>
-        </form>
-        <div class="rule-toolbar"><span>参与搜索的网站</span><button id="toggle-rules" class="text-button" type="button">全选</button></div>
+          <p class="footnote">仅读取规则，不改动 Kazumi 的配置。</p>
+        </form></details>
+        <div class="rule-toolbar"><span>勾选要搜索的网站</span><button id="toggle-rules" class="text-button" type="button">全选</button></div>
         <div id="rule-list" class="rule-list"><p class="helper-text">正在读取规则…</p></div>
-        <p class="footnote">仅读取规则，不改动 Kazumi 的配置。</p>
       </section>
       <section class="side-section model-section">
         <div class="section-heading"><h2>画质模型</h2><span id="model-badge" class="badge neutral">检查中</span></div>
-        <p class="model-name">MUSIQ <span>实验性估计</span></p>
+        <details class="settings-disclosure model-details"><summary><span class="model-name">MUSIQ</span><span class="disclosure-hint">实验性估计</span></summary><div class="settings-body">
         <p id="model-message" class="helper-text">正在检查本地评分环境…</p>
         <button id="refresh-config" class="text-button" type="button">重新检查环境</button>
+        </div></details>
       </section>
-      <div class="sidebar-note"><span class="note-mark" aria-hidden="true">i</span><p>先匹配共同画面，再估计画质。分数不是百分制；未达到比较条件的来源不会排名。</p></div>
+      <div class="sidebar-note"><span class="note-mark" aria-hidden="true">i</span><p>先匹配共同画面，再估计画质。分辨率只是画面规格，低分辨率来源也会参与比较。</p></div>
     </aside>
 
     <main>
-      <header class="page-header"><div><p class="eyebrow">画质检测工作台</p><h1>找到更清晰的播放来源</h1></div><span class="badge neutral desktop-label">本地处理 · 源站播放</span></header>
+      <header class="page-header"><div><p class="eyebrow">画质检测工作台</p><h1>为同一部番剧，找到更好的画面</h1><p class="page-intro">搜索来源，确认同季同集，再按共同画面的实际评分比较。</p></div><span class="badge neutral desktop-label">本地处理 · 源站播放</span></header>
       <div id="notice" class="notice" role="alert" hidden></div>
       <section class="panel search-panel" aria-labelledby="search-heading">
-        <div class="step-heading"><span class="step-number">1</span><h2 id="search-heading">搜索番剧</h2></div>
-        <form id="search-form" class="search-form"><label for="keyword" class="visually-hidden">番剧名称</label><div class="search-input-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 4.5 4.5"></path></svg><input id="keyword" type="search" placeholder="输入番剧名称，搜索已选网站" autocomplete="off" required maxlength="150"></div><button id="search-button" class="button primary" type="submit">搜索来源<span aria-hidden="true">↗</span></button></form>
+        <div class="step-heading"><span class="step-number" aria-hidden="true">1</span><h2 id="search-heading">搜索番剧</h2><span class="step-description">从已选网站查找</span></div>
+        <form id="search-form" class="search-form"><label for="keyword" class="visually-hidden">番剧名称</label><div class="search-input-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 4.5 4.5"></path></svg><input id="keyword" type="search" placeholder="输入完整番剧名，可注明季数" autocomplete="off" required maxlength="150" aria-describedby="search-hint"></div><button id="search-button" class="button primary" type="submit">搜索来源<span aria-hidden="true">↗</span></button></form>
         <p id="search-hint" class="helper-text">搜索后，按网站确认番剧和季数，再检测同一集的画质。</p>
       </section>
 
       <section id="job-panel" class="job-panel" aria-label="任务进度" hidden><div class="job-top"><div class="job-title"><span id="job-spinner" class="spinner" aria-hidden="true"></span><strong id="job-title">正在搜索</strong></div><button id="cancel-button" class="text-button" type="button">取消任务</button></div><div class="job-detail"><span id="job-message" role="status" aria-live="polite"></span><span id="job-percent" class="mono">0%</span></div><progress id="job-progress" max="100" value="0" aria-label="任务进度"></progress></section>
 
-      <section class="panel candidate-panel" aria-labelledby="candidate-heading"><div class="panel-heading"><div class="step-heading"><span class="step-number">2</span><h2 id="candidate-heading">确认来源</h2><span id="candidate-count" class="count-badge">0</span></div><span id="selection-summary" class="helper-text">每个网站选择一个条目</span></div>
-        <div id="candidate-empty" class="empty-state compact"><div class="empty-search" aria-hidden="true"><span></span><span></span><span></span></div><h3>先搜索想看的番剧</h3><p>这里会列出各网站找到的条目，请确认名称和季数。</p></div>
+      <section class="panel candidate-panel" aria-labelledby="candidate-heading"><div class="panel-heading"><div class="step-heading"><span class="step-number" aria-hidden="true">2</span><h2 id="candidate-heading">确认同季来源</h2><span id="candidate-count" class="count-badge">0</span></div><span id="selection-summary" class="helper-text">每个网站选择一个条目</span></div>
+        <div id="candidate-empty" class="empty-state compact"><div class="empty-search" aria-hidden="true"><span></span><span></span><span></span></div><h3>先搜索想看的番剧</h3><p>每个网站选择同一季的一个条目，至少选择两个网站。</p></div>
         <div id="candidates" class="candidates"></div>
         <div id="search-errors" class="errors-list" hidden></div>
-        <div class="analysis-controls"><div class="episode-field"><label for="episode">检测集数 <span>可选</span></label><input id="episode" type="number" min="0" max="100000" step="any" inputmode="decimal" placeholder="自动选择共同集数"><p class="helper-text">至少选择两个网站。集数留空自动选择，支持 0 与小数。</p></div><button id="analyze-button" class="button primary" type="button" disabled>开始画质检测<span aria-hidden="true">→</span></button></div>
+        <div class="analysis-controls"><div class="episode-field"><label for="episode">检测集数 <span>可选</span></label><input id="episode" type="number" min="0" max="100000" step="any" inputmode="decimal" placeholder="自动选择共同集数" aria-describedby="episode-hint"><p id="episode-hint" class="helper-text">留空自动选择共同集数，支持 0 与小数。</p></div><div class="episode-field"><label for="mode">检测方式</label><select id="mode" aria-describedby="mode-hint"><option value="fast">快速比较 · 3 组共同画面</option><option value="full">完整比较 · 4 组共同画面</option></select><p id="mode-hint" class="helper-text">都保留低分辨率来源；分数接近时可完整复测。</p></div><button id="analyze-button" class="button primary" type="button" disabled>开始画质检测<span aria-hidden="true">→</span></button></div>
       </section>
 
-      <section class="panel results-panel" aria-labelledby="results-heading"><div class="panel-heading"><div class="step-heading"><span class="step-number">3</span><h2 id="results-heading">检测结果</h2></div><span class="badge experimental">实验性估计</span></div>
+      <section class="panel results-panel" aria-labelledby="results-heading"><div class="panel-heading"><div class="step-heading"><span class="step-number" aria-hidden="true">3</span><h2 id="results-heading">画质排行</h2></div><span class="badge experimental">实验性估计</span></div>
+        <dl class="result-metrics" aria-label="本次检测概览"><div><dt>参与网站</dt><dd id="metric-sites">—</dd></div><div><dt>可比较网站</dt><dd id="metric-ranked">—</dd></div><div><dt>本次耗时</dt><dd id="metric-time">—</dd></div></dl>
         <p id="results-summary" class="result-explanation">只有匹配到足够共同画面的来源才参与排名。数值越高，模型估计的画质越好。</p>
         <div id="results-empty" class="empty-state"><div class="filmstrip" aria-hidden="true"><span></span><span></span><span></span><span></span></div><h3>等待第一次检测</h3><p>选择来源后开始检测，在这里查看线路、画面规格与实际评分。</p></div>
         <div id="results-table-wrap" class="table-wrap" hidden><table><caption class="visually-hidden">各网站线路的画质检测结果与处理状态</caption><thead><tr><th scope="col">排名</th><th scope="col">来源 / 线路</th><th scope="col">画面规格</th><th scope="col">画质估计</th><th scope="col">过程与样本</th><th scope="col">播放页</th></tr></thead><tbody id="results-body"></tbody></table></div>
         <div id="analysis-errors" class="errors-list" hidden></div>
-        <footer class="results-footer">模型尚未经过动画领域校准。小幅分差仅作倾向参考，分辨率不等同于画质。</footer>
+        <footer class="results-footer">模型尚未经过动画领域校准，分数不是百分制。小幅分差仅作倾向参考，未评分不代表画质为零。</footer>
       </section>
+      <details class="diagnostics-panel" id="diagnostics"><summary><span>处理记录与诊断</span><span class="disclosure-hint">查看阶段耗时与处理提示</span></summary><div class="diagnostics-body"><pre id="diagnostics-summary">还没有处理记录。开始搜索或检测后，可在这里查看阶段耗时与处理提示。</pre></div></details>
       <footer class="page-footer"><span>Kazumi 本地画质助手</span><span>搜索 · 内容匹配 · 画质估计</span></footer>
     </main>
   </div>

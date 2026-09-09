@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
+import threading
 import time
 import unicodedata
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
@@ -191,6 +193,50 @@ def _decode(raw: bytes, headers: dict) -> str:
     raise RuleError("响应文本编码无法识别，请检查站点的字符编码配置")
 
 
+def _response_body(response, deadline: float) -> bytes:
+    """按块读取正文；截止时中断本次响应，避免滴流与压缩头绕过总超时。"""
+    connection_socket = getattr(getattr(response.raw, "_connection", None), "sock", None)
+    if not isinstance(connection_socket, socket.socket):
+        # Connection: close 响应在 urllib3 中可能已清空 connection.sock，
+        # http.client 的缓冲流仍持有本次响应自己的 socket。
+        stream = getattr(getattr(response.raw, "_fp", None), "fp", None)
+        connection_socket = getattr(getattr(stream, "raw", None), "_sock", None)
+    expired = threading.Event()
+    timer = None
+    if isinstance(connection_socket, socket.socket):
+        def abort_response():
+            expired.set()
+            try:
+                connection_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        timer = threading.Timer(max(0, deadline - time.monotonic()), abort_response)
+        timer.daemon = True
+        timer.start()
+    try:
+        content = bytearray()
+        # 非标准请求适配器若不暴露 socket，保留逐字节回退及逐次截止检查。
+        for chunk in response.iter_content(chunk_size=65536 if timer else 1):
+            if expired.is_set() or time.monotonic() >= deadline:
+                raise RuleError("站点请求超时")
+            if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
+                raise RuleError("站点响应超过 8 MiB 限制")
+            content.extend(chunk)
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise RuleError("站点请求超时")
+        return bytes(content)
+    except requests.RequestException as error:
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise RuleError("站点请求超时") from error
+        raise
+    finally:
+        if timer is not None:
+            # 等定时器彻底退出，再由 response 上下文释放或复用连接。
+            timer.cancel()
+            timer.join()
+
+
 def _fetch(request: dict, timeout: float = 20, captcha_rule: dict | None = None) -> str:
     if not isinstance(timeout, (int, float)) or not 0 < timeout <= 120:
         raise RuleError("请求超时必须在 0 到 120 秒之间")
@@ -220,17 +266,7 @@ def _fetch(request: dict, timeout: float = 20, captcha_rule: dict | None = None)
                     size = response.headers.get("Content-Length", "")
                     if size.isdigit() and int(size) > MAX_RESPONSE_BYTES:
                         raise RuleError("站点响应超过 8 MiB 限制")
-                    # 大块读取会等待填满缓冲；慢速持续发送数据可使总超时失效。
-                    # 单字节读取在正文产生数据后检查截止时间，正文用连续缓冲累计。
-                    content, total = bytearray(), 0
-                    for chunk in response.iter_content(chunk_size=1):
-                        total += len(chunk)
-                        if total > MAX_RESPONSE_BYTES:
-                            raise RuleError("站点响应超过 8 MiB 限制")
-                        if time.monotonic() > deadline:
-                            raise RuleError("站点请求超时")
-                        content.extend(chunk)
-                    raw = _decode(bytes(content), response.headers)
+                    raw = _decode(_response_body(response, deadline), response.headers)
                     _captcha(captcha_rule or {}, raw)
                     response.raise_for_status()
                     return raw
@@ -348,6 +384,17 @@ def search(rule: dict, keyword: str, timeout: float = 20) -> list[dict]:
     return parse_search(rule, _fetch(request, timeout, rule))
 
 
+def _unique_entries(items: list[dict], label_key: str) -> list[dict]:
+    """仅合并标签和地址都相同的条目，保留不同地址造成的真实歧义。"""
+    seen, result = set(), []
+    for item in items:
+        key = (item[label_key], item["url"])
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
 def parse_search(rule: dict, raw: str) -> list[dict]:
     _captcha(rule, raw)
     result = []
@@ -372,7 +419,7 @@ def parse_search(rule: dict, raw: str) -> list[dict]:
                     result.append({"title": title, "url": _http_url(source, _base(rule))})
                 except RuleError:
                     continue
-    return result
+    return _unique_entries(result, "title")
 
 
 def episode_number(name: str) -> int | float | None:
@@ -417,7 +464,11 @@ def chapters(rule: dict, source: str, timeout: float = 20) -> list[dict]:
 def _episode_url(config: dict, variables: dict, raw_url: str, road_index: int, episode_index: int, base: str) -> str:
     page = config.get("episodePage")
     if page is None:
-        return _http_url(raw_url, base) if raw_url else ""
+        try:
+            return _http_url(raw_url, base) if raw_url else ""
+        except RuleError:
+            # 和 XPath 一致：跳过占位、脚本与失效链接，保留其余有效集数。
+            return ""
     if not isinstance(page, dict) or not _string(page.get("url")):
         raise RuleError("播放页地址模板不能为空")
     context = {**variables, "episodeUrl": raw_url, "roadIndex": road_index, "roadNumber": road_index + 1,
@@ -444,10 +495,10 @@ def parse_chapters(rule: dict, raw: str, source: str = "") -> list[dict]:
                     url = _http_url(url, base)
                 except RuleError:
                     continue
-                name = re.sub(r"\s+", "", _node_text([node]))
+                name = re.sub(r"\s+", " ", _node_text([node])).strip()
                 episodes.append(_episode(name, url))
             if episodes:
-                roads.append({"name": f"播放线路{len(roads) + 1}", "episodes": episodes})
+                roads.append({"name": f"播放线路{len(roads) + 1}", "episodes": _unique_entries(episodes, "name")})
         return roads
     config = rule.get("chapterApiConfig", {})
     document = _json_document(raw)
@@ -497,5 +548,5 @@ def parse_chapters(rule: dict, raw: str, source: str = "") -> list[dict]:
             if url:
                 episodes.append(_episode(episode_name, url))
         if episodes:
-            roads.append({"name": name or f"播放线路{len(roads) + 1}", "episodes": episodes})
+            roads.append({"name": name or f"播放线路{len(roads) + 1}", "episodes": _unique_entries(episodes, "name")})
     return roads

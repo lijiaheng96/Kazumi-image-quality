@@ -32,6 +32,18 @@ class JobLogicTests(unittest.TestCase):
         self.assertEqual(job.snapshot()['status'], 'cancelled')
         self.assertEqual(len(job.snapshot()['results']), 1)
 
+    def test_cancelled_search_never_starts_queued_site_requests(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            manager=self.j.JobManager(Path(temp))
+            job=self.j.Job('search')
+            job.cancel.set()
+            with patch('helper.rules.search',side_effect=AssertionError('已取消，不应联网')):
+                manager._search(job,[{'name':str(i)} for i in range(9)],'动画',list(range(9)))
+            self.assertEqual(job.snapshot()['results'],[])
+
     def test_cancel_analysis_keeps_completed_scores_and_marks_pending_rows(self):
         job = self.j.Job('analyze')
         job.update(results=[

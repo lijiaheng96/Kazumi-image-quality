@@ -20,6 +20,7 @@ const nodes = new Map();
 const getNode = (id) => { if (!nodes.has(id)) nodes.set(id, new NodeStub()); return nodes.get(id); };
 const config = { token: '测试令牌', rules_path: 'C:\\规则.json', rules: [{ id: 0, name: '网站甲' }, { id: 1, name: '网站乙' }], discovered_paths: [], model_ready: true, busy: false };
 const calls = [];
+const extraResponses = new Map();
 let failure = null;
 const context = vm.createContext({
   console, URL, AbortController, setTimeout: () => 1, clearTimeout: () => {},
@@ -29,12 +30,12 @@ const context = vm.createContext({
   fetch: async (url, options) => {
     calls.push({ url, options });
     if (failure && (!failure.url || failure.url === url)) return { ok: false, status: failure.status, json: async () => failure.body };
-    const data = url === '/api/config' ? config : url.startsWith('/api/jobs/') ? { status: 'completed', results: [], errors: [], progress: 100 } : { job_id: '测试任务' };
+    const data = extraResponses.has(url) ? extraResponses.get(url) : url === '/api/config' ? config : url.startsWith('/api/jobs/') ? { status: 'completed', results: [], errors: [], progress: 100 } : { job_id: '测试任务' };
     return { ok: true, status: 200, json: async () => data };
   },
 });
 const script = fs.readFileSync(path.join(__dirname, '..', 'web', 'app.js'), 'utf8');
-vm.runInContext(script + '\nglobalThis.ui = { state, request, updateControls, selectedSiteCount, selectedRuleIds, renderAnalysis, safeUrl, pollJob };', context);
+vm.runInContext(script + '\nglobalThis.ui = { state, request, updateControls, selectedSiteCount, selectedRuleIds, renderAnalysis, safeUrl, pollJob, restoreSelection };', context);
 const ui = context.ui;
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 const visibleText = (node) => [node.textContent, ...node.children.map(visibleText)].join(' ');
@@ -79,9 +80,11 @@ async function run() {
   for (const input of ['0', '12.5', '']) {
     ui.state.busy = false; ui.state.requesting = false; ui.state.searchJobId = '搜索任务';
     getNode('episode').value = input;
+    getNode('mode').value = input === '0' ? 'full' : 'fast';
     await getNode('analyze-button').listeners.click();
     const post = calls.filter((call) => call.url === '/api/analyze' && call.options.method === 'POST').at(-1);
     const body = JSON.parse(post.options.body);
+    assert.equal(body.mode, getNode('mode').value, '检测模式传到后端');
     if (input) assert.equal(body.episode, Number(input), '支持零集与小数集号');
     else assert.equal('episode' in body, false, '自动集数省略 episode');
     await settle();
@@ -107,6 +110,22 @@ async function run() {
   assert.equal(ui.state.busy, false, '404 解除界面忙碌锁定');
   assert.equal(getNode('search-button').disabled, false, '任务过期后可重新搜索');
   assert.match(getNode('notice').textContent, /任务已过期/);
+  ui.renderAnalysis({status:'completed', mode:'fast',elapsed_seconds:65.5,results:[{
+    site:'测试站',status:'已完成',score:70,rank:1,bitrate:4000000,timings:{'取样与对齐':12.3,'评分':4.1},samples:3
+  }]});
+  assert.match(visibleText(getNode('results-body')), /4\.00 Mbps/, '显示可用码率');
+  assert.match(visibleText(getNode('results-body')), /取样与对齐.*12\.3/, '显示分阶段耗时');
+  assert.match(getNode('results-summary').textContent, /快速.*65\.5/, '显示模式及实际总耗时');
+  failure = null;
+  ui.state.searchJobId=null;
+  extraResponses.set('/api/jobs/original', {id:'original',kind:'search',status:'completed',results:[
+    {id:'a',site:'甲',title:'第一季',selected:true}, {id:'b',site:'甲',title:'第二季',selected:false},
+    {id:'c',site:'乙',title:'第二季',selected:false}
+  ]});
+  await ui.restoreSelection({search_job_id:'original',selected_candidate_ids:['b','c'],mode:'full',episode:2});
+  assert.deepEqual([...ui.state.selected].sort(),['b','c'],'刷新后恢复用户实际选择，而非原自动预选');
+  assert.equal(ui.state.searchJobId,'original');
+  assert.equal(getNode('mode').value,'full');
   console.log('前端契约验证通过：中文错误、令牌恢复、网站门槛、规则编号、可选集数、评分空值、安全链接与过期任务恢复。');
 }
 

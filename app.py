@@ -10,6 +10,7 @@ import socket
 import threading
 import webbrowser
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -36,6 +37,7 @@ class AnalyzeInput(BaseModel):
     search_job_id: str
     candidate_ids: list[str] = Field(min_length=2, max_length=100)
     episode: float | None = Field(default=None, ge=0, le=100000)
+    mode: Literal['fast', 'full'] = 'fast'
 
 
 def create_app(data_dir: Path | None = None):
@@ -91,7 +93,25 @@ def create_app(data_dir: Path | None = None):
         return dict(rules_path=state['rules_path'], discovered_paths=rules.discover_rule_files(),
                     rules=[dict(id=index,name=rule.get('name', f'规则 {index+1}')) for index,rule in enumerate(state['rules'])],
                     model_ready=installed, model_message='已安装本地模型环境，首次检测会加载权重' if installed else '尚未安装分析环境',
-                    busy=manager.busy(), token=token)
+                    busy=manager.busy(), token=token, active_job=manager.current())
+
+    @application.get('/api/diagnostics')
+    def get_diagnostics():
+        return manager.diagnostics.summary()
+
+    @application.get('/api/recent')
+    def get_recent():
+        with manager.lock:
+            if manager.jobs:
+                job=next(reversed(manager.jobs.values()))
+                return {'job':job.snapshot(),'live':True}
+        report=manager.diagnostics.latest()
+        if report and report['job']['status']=='running':
+            report['job'].update(status='interrupted',message='上次服务退出时任务尚未完成；以下是中断前的最近记录，请重新搜索后检测')
+            for row in report['job']['results']:
+                if not row.get('rank') and row.get('status')!='未参与排名':
+                    row.update(status='已中断',message='服务退出前尚未形成完整结果，无法续跑旧媒体会话')
+        return {'job':report['job'] if report else None,'live':False}
 
     @application.post('/api/config')
     def save_config(body: ConfigInput):
@@ -154,7 +174,7 @@ def create_app(data_dir: Path | None = None):
         if any(candidate_id not in known_ids for candidate_id in body.candidate_ids):
             raise HTTPException(400, '选择包含无效来源，请重新搜索')
         try:
-            job = manager.analyze(source, set(body.candidate_ids), body.episode)
+            job = manager.analyze(source, set(body.candidate_ids), body.episode, body.mode)
             return {'job_id':job.id}
         except ValueError as error:
             raise HTTPException(409 if manager.busy() else 400, str(error)) from error

@@ -103,11 +103,18 @@ def rank_common(rows: list[dict]) -> list[dict]:
     return sorted(output, key=lambda row: (row.get('rank') or 9999, -(row.get('score') or 0)))
 
 
+def cpu_inference_threads() -> int:
+    """根据逻辑 CPU 数选择推理线程，限制低核机器的资源占用。"""
+    logical_cpus = os.cpu_count() or 2
+    return 8 if logical_cpus >= 12 else max(1, min(4, logical_cpus))
+
+
 class QualityModel:
     """惰性加载真实 MUSIQ 模型，权重只缓存到本工具目录。"""
     def __init__(self):
         self._model = None
         self._lock = threading.Lock()
+        self._inference_lock = threading.Lock()
 
     @staticmethod
     def installed() -> bool:
@@ -121,30 +128,61 @@ class QualityModel:
                         raise RuntimeError('尚未安装画质分析环境，请运行安装依赖脚本')
                     import torch
                     import pyiqa
-                    torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
+                    torch.set_num_threads(cpu_inference_threads())
                     self._model = pyiqa.create_metric('musiq', device='cpu')
         return self._model
 
     def score(self, paths: list[str], cancel: threading.Event) -> list[float]:
-        model = self.load()
-        import torch
-        result = []
-        for path in paths:
+        if cancel.is_set():
+            raise RuntimeError('检测已取消')
+        # 并行取帧可以重叠，共享 CPU 模型需串行推理，避免线程竞争和内存叠加。
+        while not self._inference_lock.acquire(timeout=.1):
             if cancel.is_set():
                 raise RuntimeError('检测已取消')
-            with Image.open(path) as original:
-                # 统一显示宽度，保留宽高比，不进行锐化或自动对比度调整。
-                image = original.convert('RGB')
-                width = 960
-                height = max(1, round(image.height * width / image.width))
-                image = image.resize((width, height), Image.Resampling.BICUBIC)
-                tensor = torch.from_numpy(np.asarray(image, dtype=np.float32).copy() / 255).permute(2,0,1).unsqueeze(0)
-            with torch.inference_mode():
-                score = float(model(tensor).item())
-            if not math.isfinite(score):
-                raise RuntimeError('画质模型返回无效结果')
-            result.append(score)
-        return result
+        try:
+            if cancel.is_set():
+                raise RuntimeError('检测已取消')
+            model = self.load()
+            import torch
+            result = []
+            batch = []
+
+            def infer_batch():
+                if cancel.is_set():
+                    raise RuntimeError('检测已取消')
+                with torch.inference_mode():
+                    values = model(torch.stack(batch)).reshape(-1).tolist()
+                if cancel.is_set():
+                    raise RuntimeError('检测已取消')
+                if len(values) != len(batch):
+                    raise RuntimeError('画质模型返回的结果数量与画面数量不一致')
+                if not all(math.isfinite(value) for value in values):
+                    raise RuntimeError('画质模型返回无效结果')
+                result.extend(values)
+                batch.clear()
+
+            for path in paths:
+                if cancel.is_set():
+                    raise RuntimeError('检测已取消')
+                with Image.open(path) as original:
+                    # 保留既有显示尺寸和全部模型 patch，不按分辨率、码率或预评分筛掉画面。
+                    image = original.convert('RGB')
+                    width = 960
+                    height = max(1, round(image.height * width / image.width))
+                    image = image.resize((width, height), Image.Resampling.BICUBIC)
+                    tensor = torch.from_numpy(np.asarray(image, dtype=np.float32).copy() / 255).permute(2, 0, 1)
+                # 宽高比不同则先完成上一批，不能为了凑批次拉伸、裁剪或填充画面。
+                if batch and tensor.shape != batch[0].shape:
+                    infer_batch()
+                batch.append(tensor)
+                # 每位置三帧可一次推理，并限制单次推理的内存和取消等待时间。
+                if len(batch) == 3:
+                    infer_batch()
+            if batch:
+                infer_batch()
+            return result
+        finally:
+            self._inference_lock.release()
 
 
 MODEL = QualityModel()

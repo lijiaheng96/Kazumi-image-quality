@@ -260,7 +260,19 @@ def _parse_metadata(output: str) -> dict:
         color = re.search(r"\b(bt709|smpte2084|arib-std-b67|gamma22|gamma28|smpte170m|bt2020-10|bt2020-12)\b", video_line)
         if color:
             color_transfer = color.group(1)
-    return {"duration": duration, "width": int(dimensions.group(1)), "height": int(dimensions.group(2)),
+    width, height = int(dimensions.group(1)), int(dimensions.group(2))
+    display_aspect_ratio = width / height
+    # 非方形像素素材应按显示画幅比较，不能把 720×480 宽屏误判成裁剪版。
+    # 优先使用 FFmpeg 报告的 DAR；仅有 SAR 时按编码尺寸换算。
+    for label in ("DAR", "SAR"):
+        ratio = re.search(rf"\b{label}\s+([1-9]\d*):([1-9]\d*)\b", video_line)
+        if ratio:
+            display_aspect_ratio = int(ratio.group(1)) / int(ratio.group(2))
+            if label == "SAR":
+                display_aspect_ratio *= width / height
+            break
+    return {"duration": duration, "width": width, "height": height,
+            "display_aspect_ratio": display_aspect_ratio,
             "codec": codec.group(1), "fps": float(fps.group(1)) if fps else None,
             "bitrate": int(float(bitrate.group(1)) * 1000) if bitrate else None, "color_transfer": color_transfer}
 
@@ -278,27 +290,49 @@ def _finite_nonnegative(value: float) -> bool:
 
 
 def capture_frames(media: dict, times: list[float], directory: Path, cancel: threading.Event) -> list[dict]:
-    """精确解码指定时间点，失败时不返回部分结果；输出路径归调用者管理。"""
+    """相邻采样共用一次解码；time 是请求时间，actual_time 是所取首帧的真实时间。"""
     _check_cancel(cancel)
     if not all(_finite_nonnegative(value) for value in times):
         raise ValueError("取帧时间必须是有限的非负秒数")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     prefix = uuid.uuid4().hex[:12]
-    frames = []
+    frames = [None] * len(times)
     created = []
     try:
-        for index, timestamp in enumerate(times):
+        # 仅合并短区间，避免两个相距很远的请求迫使 FFmpeg 解码整段影片。
+        groups = []
+        for index, timestamp in sorted(enumerate(times), key=lambda item: item[1]):
+            if not groups or timestamp - groups[-1][0][1] > 3 or len(groups[-1]) >= 12:
+                groups.append([])
+            groups[-1].append((index, timestamp))
+        for group in groups:
             _check_cancel(cancel)
-            path = directory / f"{prefix}_{index:04d}.png"
-            created.append(path)
-            args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                    "-threads", "2", "-ss", f"{timestamp:.6f}"] + _input_args(media)
-            args += ["-map", "0:v:0", "-an", "-sn", "-vf", _SCALE, "-frames:v", "1", "-threads", "2", str(path)]
+            start = float(f"{group[0][1]:.6f}")
+            args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin", "-y",
+                    "-filter_complex_threads", "2", "-threads", "2", "-ss", f"{start:.6f}"] + _input_args(media)
+            graph = [f"[0:v:0]split={len(group)}" + "".join(f"[in{index}]" for index, _ in group)]
+            outputs = []
+            for index, timestamp in group:
+                path = directory / f"{prefix}_{index:04d}.png"
+                created.append(path)
+                # trim 保留原始 PTS，每支只取目标之后的首帧，兼容非整帧时间和变帧率。
+                # 必须先选择再缩放；fps 滤镜会按采样网格复制/舍入帧，不能用于精确评分。
+                graph.append(f"[in{index}]trim=start={timestamp - start:.6f},select='eq(n,0)',"
+                             f"{_SCALE},showinfo@sample{index}=checksum=0[out{index}]")
+                outputs += ["-map", f"[out{index}]", "-an", "-sn", "-frames:v", "1", "-fps_mode", "passthrough",
+                            "-threads", "2", "-update", "1", str(path)]
+            args += ["-filter_complex", ";".join(graph)] + outputs
             result = _run_process(args, cancel, timeout=45)
-            if result.returncode or not path.is_file() or path.stat().st_size == 0:
-                raise ValueError("视频提帧失败，该时间点不可用或源站拒绝读取")
-            frames.append({"time": float(timestamp), "path": str(path.resolve())})
+            actual_times = {int(match.group(1)): start + float(match.group(2)) for match in re.finditer(
+                r"\[showinfo@sample(\d+)\s+@[^\]]+\]\s+n:\s*0\s+pts:\s*-?\d+\s+pts_time:([-\d.e+]+)", result.stderr)}
+            for index, timestamp in group:
+                path = directory / f"{prefix}_{index:04d}.png"
+                actual_time = actual_times.get(index)
+                if (result.returncode or not path.is_file() or path.stat().st_size == 0
+                        or actual_time is None or not math.isfinite(actual_time)):
+                    raise ValueError("视频提帧失败，该时间点不可用或源站拒绝读取")
+                frames[index] = {"time": float(timestamp), "actual_time": actual_time, "path": str(path.resolve())}
         return frames
     except BaseException:
         for path in created:
@@ -307,19 +341,22 @@ def capture_frames(media: dict, times: list[float], directory: Path, cancel: thr
 
 
 def capture_sequence(media: dict, start: float, duration: float, step: float, directory: Path,
-                     cancel: threading.Event) -> list[dict]:
-    """一次解码最多 90 秒的粗匹配帧，最多 180 张；时间以请求采样网格标记。"""
+                     cancel: threading.Event, *, width: int = 1280) -> list[dict]:
+    """一次解码最多 90 秒的匹配帧；width 可缩小指纹图，时间按请求采样网格标记。"""
     _check_cancel(cancel)
     if (not _finite_nonnegative(start) or not _finite_nonnegative(duration) or duration <= 0 or duration > 90
             or not _finite_nonnegative(step) or step <= 0 or math.ceil(duration / step) > 180):
         raise ValueError("批量取帧参数无效：时长需为 0 至 90 秒，步长为正且最多 180 帧")
+    if isinstance(width, bool) or not isinstance(width, int) or not 1 <= width <= 1280:
+        raise ValueError("匹配帧宽度必须为 1 至 1280 的整数")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     prefix = uuid.uuid4().hex[:12]
     pattern = directory / f"{prefix}_%04d.png"
     args = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-threads", "2", "-ss", f"{start:.6f}"] + _input_args(media)
-    args += ["-t", f"{duration:.6f}", "-map", "0:v:0", "-an", "-sn", "-vf", f"fps=1/{step:.8f}," + _SCALE,
+    scale = f"scale=w='min({width},iw*sar)':h='max(1,round(ih*min(1,{width}/(iw*sar))))',setsar=1"
+    args += ["-t", f"{duration:.6f}", "-map", "0:v:0", "-an", "-sn", "-vf", f"fps=1/{step:.8f}," + scale,
              "-frames:v", str(math.ceil(duration / step)), "-threads", "2", str(pattern)]
     try:
         result = _run_process(args, cancel, timeout=120)

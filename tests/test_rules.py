@@ -1,5 +1,6 @@
 """规则兼容层固定响应测试；不访问真实网站。"""
 import json
+import gzip
 import http.server
 import os
 from pathlib import Path
@@ -21,6 +22,31 @@ XPATH = {
 
 
 class RuleTests(unittest.TestCase):
+    def test_search_duplicate_entries_do_not_create_ambiguous_matches(self):
+        raw = '<ul><li><a href="/1">葬送的芙莉莲</a></li><li><a href="/1">葬送的芙莉莲</a></li><li><a href="/2">葬送的芙莉莲 第二季</a></li></ul>'
+        self.assertEqual(rules.parse_search(XPATH, raw), [
+            {"title": "葬送的芙莉莲", "url": "https://anime.example/1"},
+            {"title": "葬送的芙莉莲 第二季", "url": "https://anime.example/2"}])
+
+    def test_xpath_episode_whitespace_does_not_join_separate_numbers(self):
+        raw = '<div class="road"><a href="/1">1 2</a><a href="/2">第 12 集</a></div>'
+        episodes = rules.parse_chapters(XPATH, raw)[0]["episodes"]
+        self.assertEqual([item["number"] for item in episodes], [None, 12])
+
+    def test_duplicate_episode_links_do_not_make_episode_ambiguous(self):
+        raw = '<div class="road"><a href="/1">第1集</a><a href="/1">第1集</a><a href="/1-other">第1集</a></div>'
+        episodes = rules.parse_chapters(XPATH, raw)[0]["episodes"]
+        self.assertEqual([item["url"] for item in episodes], [
+            "https://anime.example/1", "https://anime.example/1-other"])
+
+    def test_api_invalid_episode_does_not_discard_valid_episodes(self):
+        rule = dict(XPATH, chapterMode="api")
+        raw = json.dumps({"data": {"roads": [{"episodes": [
+            {"name": "第1集", "url": "javascript:void(0)"},
+            {"name": "第2集", "url": "/2"}, {"name": "第2集", "url": "/2"}]}]}})
+        self.assertEqual(rules.parse_chapters(rule, raw)[0]["episodes"], [
+            {"name": "第2集", "url": "https://anime.example/2", "number": 2}])
+
     def test_xpath_search_chinese_relative_and_empty(self):
         raw = '<ul><li><a href="/show/1"> 葬送的芙莉莲 </a></li><li>无链接</li></ul>'
         self.assertEqual(rules.parse_search(XPATH, raw), [
@@ -183,6 +209,58 @@ class RuleTests(unittest.TestCase):
             with self.assertRaisesRegex(rules.RuleError, "超时"):
                 rules._fetch({"method": "GET", "url": f"http://127.0.0.1:{server.server_port}/"}, timeout=0.3)
             self.assertLess(time.monotonic() - started, 1.0, "少量持续到达的数据不应绕过总超时")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=3)
+
+    def test_fetch_large_page_does_not_spend_deadline_on_byte_processing(self):
+        content = ("中文正文" * 65536).encode("utf-8")
+        self.assertEqual(self._fetch_local_response(content, timeout=1.5), content.decode("utf-8"))
+
+    def test_fetch_gzip_page_and_decoded_size_limit(self):
+        content = "中文正文" * 1000
+        compressed = gzip.compress(content.encode("utf-8"))
+        self.assertEqual(self._fetch_local_response(compressed, encoding="gzip"), content)
+        with patch.object(rules, "MAX_RESPONSE_BYTES", 2000):
+            with self.assertRaisesRegex(rules.RuleError, "限制"):
+                self._fetch_local_response(compressed, encoding="gzip")
+
+    def test_fetch_slow_gzip_header_cannot_bypass_deadline(self):
+        # FNAME 标记后的文件名可以一直没有结束符，解压器因此一直没有正文输出。
+        content = b"\x1f\x8b\x08\x08\x00\x00\x00\x00\x00\xff" + b"x" * 35
+        started = time.monotonic()
+        with self.assertRaisesRegex(rules.RuleError, "超时"):
+            self._fetch_local_response(content, encoding="gzip", interval=0.05, timeout=0.25)
+        self.assertLess(time.monotonic() - started, 1.2)
+
+    def _fetch_local_response(self, content, encoding="", interval=0, timeout=3):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(content)))
+                if encoding:
+                    self.send_header("Content-Encoding", encoding)
+                self.end_headers()
+                try:
+                    if interval:
+                        for byte in content:
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            time.sleep(interval)
+                    else:
+                        self.wfile.write(content)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            return rules._fetch({"method": "GET", "url": f"http://127.0.0.1:{server.server_port}/"}, timeout)
         finally:
             server.shutdown()
             server.server_close()

@@ -37,6 +37,29 @@ class ApiTests(unittest.TestCase):
     def test_unknown_job_is_404(self):
         self.assertEqual(self.client.get('/api/jobs/missing').status_code, 404)
 
+    def test_diagnostics_and_current_job_can_be_read_after_refresh(self):
+        config=self.client.get('/api/config').json()
+        self.assertIn('active_job', config)
+        self.assertEqual(self.client.get('/api/diagnostics').status_code,200)
+        recent=self.client.get('/api/recent').json()
+        self.assertIn('job',recent)
+
+    def test_unknown_analysis_mode_is_rejected(self):
+        response=self.client.post('/api/analyze',json={'search_job_id':'x','candidate_ids':['a','b'],'mode':'unknown'},
+                                  headers={'X-Local-Token':self.token})
+        self.assertEqual(response.status_code,422)
+
+    def test_restart_recovers_interrupted_record_as_interrupted(self):
+        from helper.jobs import Job
+        from helper.diagnostics import Diagnostics
+        job=Job('analyze')
+        job.update(results=[{'site':'测试站','status':'解析中'}])
+        Diagnostics(self.root).save(job.snapshot(),[])
+        recent=self.client.get('/api/recent').json()
+        self.assertFalse(recent['live'])
+        self.assertEqual(recent['job']['status'],'interrupted')
+        self.assertEqual(recent['job']['results'][0]['status'],'已中断')
+
 
 if __name__ == '__main__':
     unittest.main()

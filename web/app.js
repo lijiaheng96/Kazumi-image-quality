@@ -2,7 +2,7 @@
 
 // 所有服务端文本通过 textContent 渲染，播放链接仅允许 HTTP(S)。
 const $ = (id) => document.getElementById(id);
-const state = { token: '', config: null, busy: false, requesting: false, jobId: null, jobKind: null, searchJobId: null, candidates: [], selected: new Set(), selectedRules: new Set(), pollVersion: 0, cancelPending: false, externalTimer: null };
+const state = { token: '', config: null, busy: false, requesting: false, jobId: null, jobKind: null, searchJobId: null, candidates: [], selected: new Set(), selectedRules: new Set(), pollVersion: 0, cancelPending: false, externalTimer: null, restored: false };
 const statusNames = { pending: '等待处理', queued: '等待处理', running: '正在处理', resolving: '正在解析', downloading: '正在取样', sampling: '正在取样', matching: '正在匹配画面', scoring: '正在估计画质', completed: '检测完成', success: '检测完成', ok: '检测完成', failed: '检测失败', error: '检测失败', cancelled: '已取消', skipped: '未参与比较', unmatched: '内容未匹配', insufficient: '样本不足', incomparable: '未达到比较条件' };
 
 function element(tag, className, value) {
@@ -114,7 +114,7 @@ function selectedRuleIds() {
 
 function updateControls() {
   const locked = state.busy || state.requesting;
-  for (const id of ['rules-path', 'discovered-paths', 'save-config', 'toggle-rules', 'keyword', 'episode', 'refresh-config']) $(id).disabled = locked;
+  for (const id of ['rules-path', 'discovered-paths', 'save-config', 'toggle-rules', 'keyword', 'episode', 'mode', 'refresh-config']) $(id).disabled = locked;
   $('search-button').disabled = locked || !state.config || !state.selectedRules.size;
   $('analyze-button').disabled = locked || !state.searchJobId || selectedSiteCount() < 2 || !state.config?.model_ready;
   $('cancel-button').disabled = !state.jobId || state.cancelPending || state.requesting;
@@ -132,6 +132,7 @@ function clearAnalysis() {
   $('analysis-errors').replaceChildren();
   $('analysis-errors').hidden = true;
   $('results-summary').textContent = '只有匹配到足够共同画面的来源才参与排名。数值越高，模型估计的画质越好。';
+  for (const id of ['metric-sites','metric-ranked','metric-time']) if ($(id)) $(id).textContent = '—';
 }
 
 function clearSearch() {
@@ -184,7 +185,10 @@ async function loadConfig(preserveSelection = false, preserveInput = false) {
   $('model-message').textContent = config.model_message || (config.model_ready ? '本地模型已就绪，可以开始画质检测。' : '本地模型尚未就绪。请检查启动窗口中的安装或下载提示。');
   if (!state.jobId) {
     state.busy = Boolean(config.busy);
-    if (state.busy) {
+    if (config.active_job?.id && config.active_job.status === 'running') {
+      await restoreSelection(config.active_job);
+      startJob(config.active_job.id, config.active_job.kind);
+    } else if (state.busy) {
       $('job-panel').hidden = false;
       $('job-title').textContent = '本地服务正在处理任务';
       $('job-message').textContent = '请等待当前任务结束，页面将自动恢复操作。';
@@ -196,7 +200,41 @@ async function loadConfig(preserveSelection = false, preserveInput = false) {
       state.externalTimer = setTimeout(pollExternalConfig, 3000);
     } else if ($('cancel-button').hidden) $('job-panel').hidden = true;
   }
+  if (!state.restored) {
+    state.restored = true;
+    if (!state.jobId && !state.searchJobId) {
+      try {
+        const recent = await request('/api/recent');
+        const job = recent.job;
+        if (job && job.status !== 'running') {
+          state.jobKind = job.kind;
+          renderProgress(job);
+          if (job.kind === 'analyze') {
+            if (recent.live) await restoreSelection(job);
+            renderAnalysis(job);
+            if (!recent.live) notify('已恢复最近一次本地检测记录。重新检测请先搜索；历史记录不保存播放链接。', true);
+          } else if (recent.live && job.status === 'completed') {
+            renderCandidates(job, true);
+            state.searchJobId = job.id;
+          }
+        }
+      } catch { /* 旧版服务没有历史接口时仍允许正常搜索。 */ }
+    }
+  }
   updateControls();
+}
+
+async function restoreSelection(job) {
+  if (!job.search_job_id || state.searchJobId) return;
+  try {
+    const search = await request(`/api/jobs/${encodeURIComponent(job.search_job_id)}`);
+    if (search.kind !== 'search' || search.status !== 'completed') return;
+    const selected = new Set(job.selected_candidate_ids || []);
+    renderCandidates({...search, results: (search.results || []).map(row => ({...row, selected: selected.has(row.id)}))}, true);
+    state.searchJobId = search.id;
+    if (job.mode) $('mode').value = job.mode;
+    if (job.episode != null) $('episode').value = String(job.episode);
+  } catch { /* 搜索记录过期时仍然恢复已有检测结果。 */ }
 }
 
 async function pollExternalConfig() {
@@ -285,6 +323,7 @@ function renderAnalysis(job) {
   const fragment = document.createDocumentFragment();
   for (const result of results) {
     const row = element('tr');
+    if (result.rank === 1 && result.best_road) row.className = 'best-result';
     const rankCell = element('td');
     const ranked = typeof result.rank === 'number' && Number.isFinite(result.rank) && result.rank > 0;
     rankCell.append(element('span', `rank${result.rank === 1 ? ' first' : ''}`, ranked ? result.rank : '—'));
@@ -292,6 +331,7 @@ function renderAnalysis(job) {
     sourceCell.append(element('div', 'result-site', result.site || '未知网站'), element('div', 'cell-detail', result.title || ''), element('div', 'cell-detail', `${result.road || '默认线路'}${result.episode != null ? ` · 第 ${result.episode} 集` : ''}`));
     const formatCell = element('td');
     formatCell.append(element('div', 'mono', result.resolution || '未取得'), element('div', 'cell-detail', result.codec || '编码未知'));
+    formatCell.append(element('div', 'cell-detail', Number.isFinite(result.bitrate) && result.bitrate > 0 ? `${(result.bitrate / 1000000).toFixed(2)} Mbps` : '码率未提供'));
     const scoreCell = element('td');
     const scored = typeof result.score === 'number' && Number.isFinite(result.score);
     scoreCell.append(element('div', scored ? 'score' : 'score missing', scored ? result.score.toFixed(2) : '未评分'));
@@ -302,6 +342,11 @@ function renderAnalysis(job) {
     processCell.append(element('div', `status-label ${statusClass}`, statusNames[status] || (/[\u3400-\u9fff]/.test(status) ? status : '处理中')));
     if (result.samples != null) processCell.append(element('div', 'cell-detail', `有效样本：${Array.isArray(result.samples) ? result.samples.length : result.samples}`));
     if (result.message) processCell.append(element('div', 'cell-detail', result.message));
+    if (Number.isFinite(result.stage_elapsed_seconds)) processCell.append(element('div', 'cell-detail', `本阶段已用 ${Math.max(0,result.stage_elapsed_seconds).toFixed(1)} 秒`));
+    for (const [stage, seconds] of Object.entries(result.timings || {})) {
+      if (Number.isFinite(seconds)) processCell.append(element('div', 'cell-detail', `${stage} ${seconds.toFixed(1)} 秒`));
+    }
+    if (result.cached) processCell.append(element('div', 'cell-detail', '复用本次相同媒体样本'));
     const actionCell = element('td');
     const actions = element('div', 'result-actions');
     actions.append(sourceLink(result.page_url, '打开 ↗'));
@@ -323,7 +368,12 @@ function renderAnalysis(job) {
   }
   const rankedCount = results.filter((result) => typeof result.rank === 'number' && result.rank > 0).length;
   const episode = job.episode != null ? `第 ${job.episode} 集 · ` : '';
-  $('results-summary').textContent = `${episode}${results.length} 条线路${rankedCount ? `，${rankedCount} 条参与排名` : '，尚无可比较排名'}。画质估计不是百分制；未评分不代表画质为零。`;
+  const timing = Number.isFinite(job.elapsed_seconds) ? ` · 耗时 ${job.elapsed_seconds.toFixed(1)} 秒` : '';
+  const mode = job.mode ? `${job.mode === 'full' ? '完整' : '快速'}比较 · ` : '';
+  $('results-summary').textContent = `${mode}${episode}${results.length} 条线路${rankedCount ? `，${rankedCount} 条参与排名` : '，尚无可比较排名'}${timing}。画质估计不是百分制；未评分不代表画质为零。`;
+  if ($('metric-sites')) $('metric-sites').textContent = String(new Set(results.map(row => row.site)).size);
+  if ($('metric-ranked')) $('metric-ranked').textContent = String(new Set(results.filter(row => row.rank > 0).map(row => row.site)).size);
+  if ($('metric-time')) $('metric-time').textContent = Number.isFinite(job.elapsed_seconds) ? `${job.elapsed_seconds.toFixed(1)} 秒` : '—';
   renderErrors('analysis-errors', job.errors);
 }
 
@@ -334,7 +384,7 @@ function renderProgress(job) {
   $('job-title').textContent = running ? (isSearch ? '正在搜索来源' : '正在检测画质') : job.status === 'completed' ? (isSearch ? '搜索完成，请确认来源' : '画质检测完成') : job.status === 'cancelled' ? '任务已取消' : '任务未完成';
   $('job-message').textContent = job.message || (running ? '正在处理，请稍候…' : '请查看下方结果。');
   const percent = typeof job.progress === 'number' ? Math.max(0, Math.min(100, job.progress)) : 0;
-  $('job-percent').textContent = `${Math.round(percent)}%`;
+  $('job-percent').textContent = `${Math.round(percent)}%${Number.isFinite(job.elapsed_seconds) ? ` · ${job.elapsed_seconds.toFixed(1)} 秒` : ''}`;
   $('job-progress').value = percent;
   $('job-spinner').hidden = !running;
   $('cancel-button').hidden = !running;
@@ -353,6 +403,7 @@ async function pollJob(id, version) {
     if (job.status === 'failed') notify(job.message || '任务未完成，请查看错误信息后重试。');
     updateControls();
     try { await loadConfig(true, true); } catch (error) { notify(error.message); }
+    await loadDiagnostics();
   } catch (error) {
     if (version !== state.pollVersion) return;
     if (error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status)) {
@@ -370,6 +421,20 @@ async function pollJob(id, version) {
     // 暂时断线时保留任务上下文，避免再次提交造成任务冲突。
     setTimeout(() => pollJob(id, version), 3000);
   }
+}
+
+async function loadDiagnostics() {
+  const target = $('diagnostics-summary');
+  if (!target) return;
+  try {
+    const summary = await request('/api/diagnostics');
+    if (!Number.isFinite(summary.jobs)) return;
+    const lines = [`已保存 ${summary.jobs} 份本地任务记录。`];
+    for (const stage of summary.stages || []) lines.push(`${stage.stage}：累计 ${stage.seconds.toFixed(1)} 秒 · ${stage.count} 次 · 平均 ${stage.average_seconds.toFixed(1)} 秒`);
+    for (const failure of summary.failures || []) lines.push(`${failure.site || '本地任务'} · ${failure.stage}失败 ${failure.count} 次`);
+    lines.push('并发阶段累计时间可能超过总耗时；评分阶段含模型排队等待。记录在本机 data/diagnostics，不保存媒体链接或凭据。');
+    target.textContent = lines.join('\n');
+  } catch { target.textContent = '暂时无法读取诊断汇总；不影响搜索和检测。'; }
 }
 
 function startJob(id, kind) {
@@ -430,7 +495,7 @@ $('analyze-button').addEventListener('click', async () => {
   if (episode !== undefined && (!Number.isFinite(episode) || episode < 0 || episode > 100000)) { notify('集数应为 0 至 100000 的数字，可填写小数，也可以留空自动选择。'); $('episode').focus(); return; }
   state.requesting = true; updateControls(); notify('');
   try {
-    const data = await request('/api/analyze', { search_job_id: state.searchJobId, candidate_ids: [...state.selected], ...(episode !== undefined ? { episode } : {}) });
+    const data = await request('/api/analyze', { search_job_id: state.searchJobId, candidate_ids: [...state.selected], mode: $('mode').value || 'fast', ...(episode !== undefined ? { episode } : {}) });
     clearAnalysis(); startJob(data.job_id, 'analyze');
   } catch (error) { notify(error.message); }
   finally { state.requesting = false; updateControls(); }
@@ -449,4 +514,4 @@ loadConfig().catch((error) => {
   $('rule-list').replaceChildren(element('p', 'helper-text', '规则未读取，请检查本地服务后重新检查环境。'));
   $('model-badge').textContent = '连接失败';
   $('model-message').textContent = '尚未连接到本地服务。';
-}).finally(() => { state.requesting = false; updateControls(); });
+}).finally(() => { state.requesting = false; updateControls(); loadDiagnostics(); });
